@@ -1,3 +1,6 @@
+import os
+os.environ["TFDS_DATA_DIR"] = "D:/tensorflow_datasets"
+
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
@@ -65,7 +68,7 @@ def make_coco_dataset(split="train", batch_size=8, image_size=(224, 224)):
 
 
 if __name__ == "__main__":
-    train_ds, info = make_coco_dataset("train[:1%]", batch_size=4)
+    train_ds, info = make_coco_dataset("train[:5%]", batch_size=4)
     for batch_images, batch_targets in train_ds.take(1):
         print("Images shape:", batch_images.shape)
         print("Bboxes shape:", batch_targets["bboxes"].shape)
