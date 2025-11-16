@@ -8,48 +8,69 @@ from tensorflow import keras
 from coco_tfds_pipeline import make_coco_dataset
 
 
-def binary_focal_loss(gamma=2.0, alpha=0.25, label_smoothing=0.0):
-    """
-    Must match the definition used in training.
-    """
-    def _loss(y_true, y_pred):
-        # Optional label smoothing
-        if label_smoothing > 0.0:
-            y_true_smoothed = y_true * (1.0 - label_smoothing) + 0.5 * label_smoothing
-        else:
-            y_true_smoothed = y_true
-
-        eps = 1e-7
-        y_pred_clipped = tf.clip_by_value(y_pred, eps, 1.0 - eps)
-
-        # BCE
-        cross_entropy = -(y_true_smoothed * tf.math.log(y_pred_clipped) +
-                          (1.0 - y_true_smoothed) * tf.math.log(1.0 - y_pred_clipped))
-
-        # p_t
-        p_t = y_true * y_pred_clipped + (1.0 - y_true) * (1.0 - y_pred_clipped)
-
-        # alpha and modulating factor
-        alpha_factor = y_true * alpha + (1.0 - y_true) * (1.0 - alpha)
-        modulating_factor = tf.pow(1.0 - p_t, gamma)
-
-        loss = alpha_factor * modulating_factor * cross_entropy
-        return tf.reduce_mean(loss)
-
-    # important: name must match what was serialized ("_loss")
-    _loss.__name__ = "_loss"
-    return _loss
+# ----------------------------
+# Config helpers
+# ----------------------------
 
 def load_config(config_path: str):
     with open(config_path, "r") as f:
         return json.load(f)
 
 
+# ----------------------------
+# COCO labels -> multi-hot
+# ----------------------------
 from coco_multilabel_utils import to_multilabel_batch
+
+# ----------------------------
+# Synthetic metadata
+# ----------------------------
+
+def add_synthetic_metadata(num_locations=4):
+    """
+    Input:  (images, multi_hot_labels)
+    Output: ((images, metadata_vec), multi_hot_labels)
+
+    metadata = [brightness, is_day, is_night, one_hot_location(num_locations)]
+            -> dim = 3 + num_locations
+    """
+    def _fn(images, multi_hot):
+        # images: [B, H, W, 3], values in [0,1]
+        batch_size = tf.shape(images)[0]
+
+        # Brightness per image
+        brightness = tf.reduce_mean(images, axis=[1, 2, 3])  # [B]
+        brightness = tf.expand_dims(brightness, -1)          # [B,1]
+
+        # Day/night flags based on brightness
+        is_day = tf.cast(brightness[:, 0] > 0.5, tf.float32)  # [B]
+        is_night = 1.0 - is_day
+
+        is_day = tf.expand_dims(is_day, -1)       # [B,1]
+        is_night = tf.expand_dims(is_night, -1)   # [B,1]
+
+        # Fake location ID (0..num_locations-1)
+        loc_ids = tf.random.uniform(
+            shape=(batch_size,),
+            minval=0,
+            maxval=num_locations,
+            dtype=tf.int32,
+        )
+        loc_onehot = tf.one_hot(loc_ids, num_locations)  # [B, num_locations]
+
+        metadata = tf.concat(
+            [brightness, is_day, is_night, loc_onehot],
+            axis=1,
+        )  # [B, 3 + num_locations]
+
+        return (images, metadata), multi_hot
+
+    return _fn
+
 
 def main():
     # ----------------------------
-    # Resolve paths & load config
+    # Paths & config
     # ----------------------------
     project_root = Path(__file__).resolve().parents[1]
     config_path = project_root / "configs" / "coco_multilabel_config.json"
@@ -58,52 +79,40 @@ def main():
     image_size = tuple(config["image_size"])
     batch_size = config["batch_size"]
     val_split = config.get("val_split", "validation[:5%]")
-    model_name = config["model_name"]
+    model_name = config.get("model_name", "coco_multimodal_mobilenetv2")
     models_dir = project_root / config.get("models_dir", "models")
+
+    num_locations = 4
+    metadata_dim = 3 + num_locations  # must match training script
 
     best_model_path = models_dir / f"{model_name}_best.keras"
     last_model_path = models_dir / f"{model_name}_last.keras"
 
     print("Project root:", project_root)
-    print("Using val split:", val_split)
+    print("Val split:   ", val_split)
     print("Looking for model:", best_model_path)
 
     # ----------------------------
-    # Load model
+    # Load model (ignore original loss)
     # ----------------------------
     if best_model_path.exists():
         model_path = best_model_path
     elif last_model_path.exists():
-        print(f"Best model not found, falling back to last model: {last_model_path}")
+        print(f"[WARN] Best model not found, using last model: {last_model_path}")
         model_path = last_model_path
     else:
         raise FileNotFoundError(
             f"Could not find model files:\n  {best_model_path}\n  {last_model_path}"
         )
 
-    print(f"Loading model from: {model_path}")
-    # model = keras.models.load_model(model_path)
-    # Pull focal params from config if present, or use defaults
-    focal_gamma = config.get("focal_gamma", 2.0)
-    focal_alpha = config.get("focal_alpha", 0.25)
-    label_smoothing = config.get("label_smoothing", 0.0)
-
-    custom_objects = {
-        "_loss": binary_focal_loss(
-            gamma=focal_gamma,
-            alpha=focal_alpha,
-            label_smoothing=label_smoothing,
-        )
-    }
-
-    model = keras.models.load_model(model_path, custom_objects=custom_objects)
-
+    # We don't need the original focal loss to run eval; recompile later.
+    print("Loading model (compile=False) from:", model_path)
+    model = keras.models.load_model(model_path, compile=False)
     model.summary()
 
     # ----------------------------
     # Build validation dataset
     # ----------------------------
-    # You already set TFDS_DATA_DIR in your env / earlier code.
     val_ds_raw, val_info = make_coco_dataset(
         split=val_split,
         batch_size=batch_size,
@@ -119,7 +128,21 @@ def main():
     val_ds = (
         val_ds_raw
         .map(to_multilabel_batch(num_classes), num_parallel_calls=AUTOTUNE)
+        .map(add_synthetic_metadata(num_locations), num_parallel_calls=AUTOTUNE)
         .prefetch(AUTOTUNE)
+    )
+
+    # ----------------------------
+    # Compile model for evaluation
+    # ----------------------------
+    # Use a simple loss here; metrics are what we mainly care about.
+    model.compile(
+        optimizer="adam",
+        loss="binary_crossentropy",
+        metrics=[
+            keras.metrics.BinaryAccuracy(name="bin_acc"),
+            keras.metrics.AUC(name="auc"),
+        ],
     )
 
     # ----------------------------
@@ -135,13 +158,13 @@ def main():
     # Inspect a few example predictions
     # ----------------------------
     print("\nShowing a few sample predictions vs ground truth (image-level labels)...")
-    threshold = 0.5  # probability threshold for considering a class "present"
+    threshold = 0.5
     num_batches_to_show = 3
 
     batch_idx = 0
-    for images, multi_hot_gt in val_ds.take(num_batches_to_show):
-        preds = model(images, training=False).numpy()  # [B, num_classes]
-        multi_hot_gt = multi_hot_gt.numpy()  # [B, num_classes]
+    for (images, metadata), multi_hot_gt in val_ds.take(num_batches_to_show):
+        preds = model([images, metadata], training=False).numpy()  # [B, C]
+        multi_hot_gt = multi_hot_gt.numpy()  # [B, C]
 
         batch_size_actual = images.shape[0]
         for i in range(batch_size_actual):
@@ -160,7 +183,7 @@ def main():
 
         batch_idx += 1
 
-    print("\nDone. You can tweak 'threshold' or 'num_batches_to_show' in eval_coco_multilabel.py for more detail.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

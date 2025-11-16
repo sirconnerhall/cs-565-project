@@ -3,3 +3,4 @@ tensorflow-datasets==4.8.3
 protobuf==3.19.6
 matplotlib
 numpy<2
+Pillow

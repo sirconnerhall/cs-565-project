@@ -3,10 +3,10 @@ from pathlib import Path
 
 import tensorflow as tf
 from tensorflow import keras
-from  keras import layers
+from keras import layers
 
 from coco_tfds_pipeline import make_coco_dataset
-from cct_pipeline import make_cct_dataset
+
 
 # ----------------------------
 # Config helpers
@@ -18,67 +18,100 @@ def load_config(config_path: str):
 
 
 # ----------------------------
-# Loss: Focal + optional smoothing
+# Loss: focal with optional smoothing
 # ----------------------------
 
 def binary_focal_loss(gamma=2.0, alpha=0.25, label_smoothing=0.0):
-    """
-    Binary focal loss for multi-label classification.
-
-    gamma: focusing parameter, typically 2.0
-    alpha: weight for positive examples, typically 0.25
-    label_smoothing: e.g. 0.1 to soften targets slightly
-    """
     def _loss(y_true, y_pred):
-        # Optional label smoothing
+        # Optional label smoothing (toward 0.5)
         if label_smoothing > 0.0:
-            # For multi-label, smooth toward 0.5
-            y_true_smoothed = y_true * (1.0 - label_smoothing) + 0.5 * label_smoothing
-        else:
-            y_true_smoothed = y_true
+            y_true = y_true * (1.0 - label_smoothing) + 0.5 * label_smoothing
 
         eps = 1e-7
         y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
 
-        # Standard BCE
-        cross_entropy = -(y_true_smoothed * tf.math.log(y_pred) +
-                          (1.0 - y_true_smoothed) * tf.math.log(1.0 - y_pred))
+        # BCE
+        ce = -(y_true * tf.math.log(y_pred) +
+               (1.0 - y_true) * tf.math.log(1.0 - y_pred))
 
-        # p_t is probability of the true class
+        # p_t
         p_t = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
 
-        # alpha balancing factor
+        # alpha, modulating
         alpha_factor = y_true * alpha + (1.0 - y_true) * (1.0 - alpha)
-
-        # modulating factor
         modulating_factor = tf.pow(1.0 - p_t, gamma)
 
-        loss = alpha_factor * modulating_factor * cross_entropy
+        loss = alpha_factor * modulating_factor * ce
         return tf.reduce_mean(loss)
 
+    _loss.__name__ = "_loss"
     return _loss
 
 
 # ----------------------------
-# Data: labels -> multi-hot
+# COCO labels -> multi-hot
 # ----------------------------
 from coco_multilabel_utils import to_multilabel_batch
 
 # ----------------------------
-# Model builder
+# Synthetic metadata
 # ----------------------------
 
-def build_multilabel_model(
+def add_synthetic_metadata(num_locations=4):
+    """
+    Input:  (images, multi_hot_labels)
+    Output: ((images, metadata_vec), multi_hot_labels)
+
+    metadata = [brightness, is_day, is_night, one_hot_location(num_locations)]
+            -> dim = 3 + num_locations
+    """
+    def _fn(images, multi_hot):
+        # images: [B, H, W, 3], values in [0,1]
+        batch_size = tf.shape(images)[0]
+
+        # Brightness per image
+        brightness = tf.reduce_mean(images, axis=[1, 2, 3])  # [B]
+        brightness = tf.expand_dims(brightness, -1)          # [B,1]
+
+        # Day/night flags based on brightness
+        is_day = tf.cast(brightness[:, 0] > 0.5, tf.float32)     # [B]
+        is_night = 1.0 - is_day
+
+        is_day = tf.expand_dims(is_day, -1)       # [B,1]
+        is_night = tf.expand_dims(is_night, -1)   # [B,1]
+
+        # Fake location ID (0..num_locations-1) — random for now
+        loc_ids = tf.random.uniform(
+            shape=(batch_size,),
+            minval=0,
+            maxval=num_locations,
+            dtype=tf.int32,
+        )
+        loc_onehot = tf.one_hot(loc_ids, num_locations)  # [B, num_locations]
+
+        metadata = tf.concat(
+            [brightness, is_day, is_night, loc_onehot],
+            axis=1,
+        )  # [B, 3 + num_locations]
+
+        return (images, metadata), multi_hot
+
+    return _fn
+
+
+# ----------------------------
+# Multimodal model
+# ----------------------------
+
+def build_multimodal_model(
     image_size=(224, 224),
     num_classes=80,
+    metadata_dim=7,
     base_trainable=False,
-    name="coco_multilabel_mobilenetv2",
+    name="coco_multimodal_mobilenetv2",
 ):
-    """
-    Simple MobileNetV2 backbone + multi-label sigmoid head.
-    """
-    inputs = keras.Input(shape=(*image_size, 3))
-
+    # Image branch
+    image_input = keras.Input(shape=(*image_size, 3), name="image")
     base_model = keras.applications.MobileNetV2(
         input_shape=(*image_size, 3),
         include_top=False,
@@ -86,25 +119,38 @@ def build_multilabel_model(
     )
     base_model.trainable = base_trainable
 
-    x = keras.applications.mobilenet_v2.preprocess_input(inputs)
-    x = base_model(x, training=False)
-    x = layers.GlobalAveragePooling2D()(x)
+    x_img = keras.applications.mobilenet_v2.preprocess_input(image_input)
+    x_img = base_model(x_img, training=False)
+    x_img = layers.GlobalAveragePooling2D()(x_img)
+    x_img = layers.Dropout(0.3)(x_img)
+
+    # Metadata branch
+    meta_input = keras.Input(shape=(metadata_dim,), name="metadata")
+    x_meta = layers.Dense(32, activation="relu")(meta_input)
+    x_meta = layers.Dense(16, activation="relu")(x_meta)
+
+    # Fuse
+    x = layers.Concatenate()([x_img, x_meta])
+    x = layers.Dense(128, activation="relu")(x)
     x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(num_classes, activation="sigmoid")(x)
 
-    model = keras.Model(inputs, outputs, name=name)
+    model = keras.Model(
+        inputs=[image_input, meta_input],
+        outputs=outputs,
+        name=name,
+    )
     return model
+
 
 def get_backbone(model):
     """
-    Find the backbone sub-model inside the main model.
-    We assume it's the first layer that is itself a Keras Model
-    (e.g. the MobileNetV2 Functional model).
+    Find the backbone sub-model inside the main model (first Keras Model layer).
     """
     for layer in model.layers:
         if isinstance(layer, keras.Model):
             return layer
-    raise ValueError("Could not find backbone sub-model inside the model.")
+    raise ValueError("Backbone not found in model.layers")
 
 
 # ----------------------------
@@ -112,7 +158,6 @@ def get_backbone(model):
 # ----------------------------
 
 def main():
-    # Paths & config
     project_root = Path(__file__).resolve().parents[1]
     config_path = project_root / "configs" / "coco_multilabel_config.json"
     config = load_config(str(config_path))
@@ -123,27 +168,31 @@ def main():
     train_split = config["train_split"]
     val_split = config["val_split"]
     learning_rate = config["learning_rate"]
-    model_name = config["model_name"]
-    models_dir = project_root / config["models_dir"]
+    model_name = config.get("model_name", "coco_multimodal_mobilenetv2")
+    models_dir = project_root / config.get("models_dir", "models")
 
-    # New optional config entries (with defaults if missing)
+    # Focal / FT config with defaults
     focal_gamma = config.get("focal_gamma", 2.0)
     focal_alpha = config.get("focal_alpha", 0.25)
     label_smoothing = config.get("label_smoothing", 0.0)
-    fine_tune_backbone = config.get("fine_tune_backbone", False)
-    fine_tune_lr = config.get("fine_tune_lr", 1e-5)
+    fine_tune_backbone = config.get("fine_tune_backbone", True)
     fine_tune_after_epochs = config.get("fine_tune_after_epochs", 5)
+    fine_tune_lr = config.get("fine_tune_lr", 1e-5)
+    fine_tune_fraction = config.get("fine_tune_fraction", 0.8)
+
+    # Synthetic metadata shape
+    num_locations = 4
+    metadata_dim = 3 + num_locations
 
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Project root:", project_root)
     print("Train split:", train_split)
     print("Val split:  ", val_split)
-    print("Using focal loss: gamma=", focal_gamma, "alpha=", focal_alpha)
+    print("Using focal loss (gamma, alpha):", focal_gamma, focal_alpha)
     print("Label smoothing:", label_smoothing)
     print("Fine-tune backbone:", fine_tune_backbone)
 
-    # Load datasets
+    # Datasets
     train_ds_raw, train_info = make_coco_dataset(
         split=train_split,
         batch_size=batch_size,
@@ -160,26 +209,29 @@ def main():
 
     AUTOTUNE = tf.data.AUTOTUNE
 
+    # (images, {bboxes, labels}) -> (images, multi_hot)
     train_ds = (
         train_ds_raw
         .map(to_multilabel_batch(num_classes), num_parallel_calls=AUTOTUNE)
+        .map(add_synthetic_metadata(num_locations), num_parallel_calls=AUTOTUNE)
         .prefetch(AUTOTUNE)
     )
     val_ds = (
         val_ds_raw
         .map(to_multilabel_batch(num_classes), num_parallel_calls=AUTOTUNE)
+        .map(add_synthetic_metadata(num_locations), num_parallel_calls=AUTOTUNE)
         .prefetch(AUTOTUNE)
     )
 
-    # Build model (backbone frozen for now)
-    model = build_multilabel_model(
+    # Model
+    model = build_multimodal_model(
         image_size=image_size,
         num_classes=num_classes,
+        metadata_dim=metadata_dim,
         base_trainable=False,
         name=model_name,
     )
 
-    # Focal loss
     loss_fn = binary_focal_loss(
         gamma=focal_gamma,
         alpha=focal_alpha,
@@ -225,31 +277,31 @@ def main():
     ]
 
     # -----------------------
-    # Phase 1: head-only train
+    # Phase 1: head-only
     # -----------------------
-    print("\n=== Phase 1: training head with frozen backbone ===")
-    history = model.fit(
+    print("\n=== Phase 1: training with frozen backbone ===")
+    first_phase_epochs = min(
+        epochs, fine_tune_after_epochs if fine_tune_backbone else epochs
+    )
+
+    model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=min(epochs, fine_tune_after_epochs if fine_tune_backbone else epochs),
+        epochs=first_phase_epochs,
         callbacks=callbacks,
     )
 
     # -----------------------
-    # Phase 2: fine-tune backbone (optional)
+    # Phase 2: fine-tune backbone
     # -----------------------
     if fine_tune_backbone and epochs > fine_tune_after_epochs:
         print("\n=== Phase 2: fine-tuning backbone ===")
 
-        # Find the backbone sub-model
         base_model = get_backbone(model)
         base_model.trainable = True
 
-        # Optionally, freeze lower layers and fine-tune only the top fraction
-        fine_tune_fraction = config.get("fine_tune_fraction", 0.8)
         num_layers = len(base_model.layers)
         freeze_until = int(num_layers * fine_tune_fraction)
-
         print(f"Backbone has {num_layers} layers, freezing first {freeze_until}.")
 
         for layer in base_model.layers[:freeze_until]:
@@ -267,16 +319,13 @@ def main():
         )
 
         remaining_epochs = epochs - fine_tune_after_epochs
-
-        history_ft = model.fit(
+        model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=remaining_epochs,
             callbacks=callbacks,
         )
 
-
-    # Save final model
     model.save(str(last_model_path))
     print(f"\nSaved last model to {last_model_path}")
     print(f"Best model (by val_auc) at {best_model_path}")
