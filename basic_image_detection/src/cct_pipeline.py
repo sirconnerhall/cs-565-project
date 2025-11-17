@@ -1,6 +1,7 @@
 import os
 import json
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import tensorflow as tf
@@ -44,6 +45,7 @@ def load_cct_annotations(
     bboxes_path,
     images_root,
     filelist_path=None,
+    filter_empty=False,
 ):
     """
     metadata_path: path to caltech_camera_traps.json (image metadata)
@@ -51,6 +53,7 @@ def load_cct_annotations(
     images_root:   directory where images are stored
     filelist_path: optional txt with one file_name per line to restrict to a subset
                    (e.g., your 5% sample).
+    filter_empty: if True, exclude images with no bbox annotations (helps with class imbalance)
 
     Returns:
         samples: list of dicts:
@@ -72,7 +75,7 @@ def load_cct_annotations(
     meta_images = meta["images"]  # list of {id, file_name, width, height, ...}
     print(f"[CCT] Loaded metadata for {len(meta_images)} images from {metadata_path}")
 
-    # Map image_id -> (file_name, width, height)
+    # Map image_id -> (file_name, width, height, metadata)
     imginfo_by_id = {}
     for img in meta_images:
         img_id = img["id"]
@@ -80,6 +83,9 @@ def load_cct_annotations(
             "file_name": img["file_name"],
             "width": img["width"],
             "height": img["height"],
+            "location": img.get("location"),
+            "date_captured": img.get("date_captured"),
+            "seq_id": img.get("seq_id"),
         }
 
     # 2) Load bbox annotations and categories
@@ -176,6 +182,9 @@ def load_cct_annotations(
 
         if len(anns) == 0:
             num_no_ann += 1
+            # Skip empty images if filter_empty is True
+            if filter_empty:
+                continue
 
         samples.append(
             {
@@ -183,6 +192,9 @@ def load_cct_annotations(
                 "full_path": str(full_path),
                 "bboxes": bboxes,
                 "labels": labels,
+                "location": info.get("location"),
+                "date_captured": info.get("date_captured"),
+                "seq_id": info.get("seq_id"),
             }
         )
 
@@ -201,6 +213,102 @@ def load_cct_annotations(
 
 
 # ----------------------------------------------------
+# Extract CCT metadata features
+# ----------------------------------------------------
+
+def extract_cct_metadata_features(sample):
+    """
+    Extract metadata features from a CCT sample.
+    
+    Args:
+        sample: Dict with keys: location, date_captured, seq_id
+    
+    Returns:
+        numpy array of metadata features:
+        - location_id (normalized)
+        - hour (0-23, normalized to 0-1)
+        - day_of_week (0-6, normalized to 0-1)
+        - month (1-12, normalized to 0-1)
+        - brightness (will be computed from image, placeholder 0 here)
+    """
+    location = sample.get("location")
+    date_str = sample.get("date_captured")
+    
+    # Location ID (normalize to 0-1, assuming max location ID ~200)
+    location_id = 0.0
+    if location is not None:
+        try:
+            loc_int = int(location) if isinstance(location, str) else location
+            location_id = float(loc_int) / 200.0  # Normalize
+        except (ValueError, TypeError):
+            pass
+    
+    # Date/time features
+    hour = 0.0
+    day_of_week = 0.0
+    month = 0.0
+    
+    if date_str:
+        try:
+            # Parse date string (format: "2013-10-04 13:31:53")
+            dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            hour = dt.hour / 23.0  # Normalize to [0, 1]
+            day_of_week = dt.weekday() / 6.0  # 0=Monday, 6=Sunday, normalize to [0, 1]
+            month = (dt.month - 1) / 11.0  # Normalize to [0, 1]
+        except (ValueError, TypeError):
+            pass
+    
+    # Brightness placeholder (will be computed from image in dataset pipeline)
+    brightness = 0.0
+    
+    return np.array([location_id, hour, day_of_week, month, brightness], dtype=np.float32)
+
+
+def add_cct_metadata(image, targets, sample_metadata):
+    """
+    Add CCT metadata to dataset pipeline.
+    Computes brightness from image and adds to metadata.
+    
+    Args:
+        image: [H, W, 3] float32 image in [0, 1]
+        targets: Dict with bboxes and labels
+        sample_metadata: Dict with location, date_captured, etc.
+    
+    Returns:
+        (image, metadata), targets
+    """
+    # Compute brightness from image
+    brightness = tf.reduce_mean(image)  # [B] or scalar
+    
+    # Extract other metadata features
+    location = sample_metadata.get("location", None)
+    date_str = sample_metadata.get("date_captured", None)
+    
+    # Location ID
+    location_id = 0.0
+    if location is not None:
+        try:
+            loc_int = int(location) if isinstance(location, str) else location
+            location_id = tf.constant(float(loc_int) / 200.0, dtype=tf.float32)
+        except (ValueError, TypeError):
+            location_id = tf.constant(0.0, dtype=tf.float32)
+    else:
+        location_id = tf.constant(0.0, dtype=tf.float32)
+    
+    # Date/time features (simplified - would need proper parsing in TF)
+    # For now, use placeholders that will be computed from date string
+    # In practice, you'd parse this in the dataset pipeline
+    hour = tf.constant(0.5, dtype=tf.float32)  # Placeholder
+    day_of_week = tf.constant(0.5, dtype=tf.float32)  # Placeholder
+    month = tf.constant(0.5, dtype=tf.float32)  # Placeholder
+    
+    # Combine metadata
+    metadata = tf.stack([location_id, hour, day_of_week, month, brightness], axis=0)
+    
+    return (image, metadata), targets
+
+
+# ----------------------------------------------------
 # Make tf.data.Dataset
 # ----------------------------------------------------
 
@@ -213,6 +321,7 @@ def make_cct_dataset(
     batch_size=8,
     image_size=(224, 224),
     shuffle=True,
+    filter_empty=False,
 ):
     """
     Build a dataset similar to make_coco_dataset:
@@ -233,6 +342,7 @@ def make_cct_dataset(
         bboxes_path=bboxes_path,
         images_root=images_root,
         filelist_path=filelist_path,
+        filter_empty=filter_empty,
     )
 
     image_paths = [s["full_path"] for s in samples]
