@@ -38,7 +38,7 @@ def get_filelist_from_splits_or_config(
     # If no explicit filelist, try to generate from splits file
     splits_path = config.get("cct_splits")
     if splits_path and Path(splits_path).exists():
-        from convert_cct_to_tfrecords import get_filenames_from_splits
+        from ..pipelines.convert_cct_to_tfrecords import get_filenames_from_splits
         
         print(f"[CCT Splits] Generating {split_name} filelist from splits file: {splits_path}")
         filenames = get_filenames_from_splits(splits_path, metadata_path, split_name)

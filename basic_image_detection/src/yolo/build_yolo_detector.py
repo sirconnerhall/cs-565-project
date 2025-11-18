@@ -11,7 +11,7 @@ import tensorflow as tf
 from tensorflow import keras
 from keras import layers
 
-from load_pretrained_detector import load_backbone
+from ..utils.load_pretrained_detector import load_backbone
 
 
 def build_ssd_detector_with_metadata(

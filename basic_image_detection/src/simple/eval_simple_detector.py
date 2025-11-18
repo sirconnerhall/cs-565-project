@@ -13,15 +13,19 @@ from tensorflow import keras
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from coco_tfds_pipeline import make_coco_dataset
-from cct_pipeline import make_cct_dataset
-from cct_tfrecords_pipeline import make_cct_tfrecords_dataset
+from ..pipelines.coco_tfds_pipeline import make_coco_dataset
+from ..pipelines.cct_pipeline import make_cct_dataset
+from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
+from ..pipelines.cct_splits_utils import get_filelist_from_splits_or_config
+from ..utils.detection_utils import compute_map
 
-from train_simple_detector import (
+from .train_simple_detector import (
     infer_grid_size,
     DetectionLossFocal,
     detection_loss,
     objectness_accuracy,
+    make_component_loss_metrics,
+    make_grid_encoder,
 )
 
 
@@ -142,18 +146,18 @@ def decode_predictions(grid_pred, num_classes, threshold=0.5, nms_iou=0.5, max_b
 # ----------------------------------------------------------
 
 def draw_boxes(image, gt_boxes, pred_boxes, class_names):
-    """
-    image: [H, W, 3]
-    gt_boxes: list of [ymin, xmin, ymax, xmax]
-    pred_boxes: same
-    """
-
-    fig, ax = plt.subplots(1, figsize=(7, 7))
+    """Draw ground truth and predicted boxes on image."""
+    fig, ax = plt.subplots(1, figsize=(10, 10))
     ax.imshow(image)
     h, w, _ = image.shape
-
+    
     # Ground truth (green)
-    for (ymin, xmin, ymax, xmax) in gt_boxes:
+    for gt_box in gt_boxes:
+        if isinstance(gt_box, dict):
+            bbox = gt_box["bbox"]
+        else:
+            bbox = gt_box
+        ymin, xmin, ymax, xmax = bbox
         rect = patches.Rectangle(
             (xmin*w, ymin*h),
             (xmax-xmin)*w,
@@ -163,10 +167,20 @@ def draw_boxes(image, gt_boxes, pred_boxes, class_names):
             facecolor="none",
         )
         ax.add_patch(rect)
-
+        if isinstance(gt_box, dict) and "class_id" in gt_box:
+            class_name = class_names[gt_box["class_id"]] if gt_box["class_id"] < len(class_names) else f"Class {gt_box['class_id']}"
+            ax.text(
+                xmin*w,
+                ymin*h - 5,
+                f"GT: {class_name}",
+                color="lime",
+                fontsize=8,
+                bbox=dict(facecolor="black", alpha=0.7),
+            )
+    
     # Predictions (red)
     for p in pred_boxes:
-        (ymin, xmin, ymax, xmax) = p["bbox"]
+        ymin, xmin, ymax, xmax = p["bbox"]
         rect = patches.Rectangle(
             (xmin*w, ymin*h),
             (xmax-xmin)*w,
@@ -176,16 +190,18 @@ def draw_boxes(image, gt_boxes, pred_boxes, class_names):
             facecolor="none",
         )
         ax.add_patch(rect)
+        class_name = class_names[p["class_id"]] if p["class_id"] < len(class_names) else f"Class {p['class_id']}"
         ax.text(
             xmin*w,
             ymin*h,
-            class_names[p["class_id"]],
+            f"{class_name} ({p['score']:.2f})",
             color="red",
             fontsize=8,
-            bbox=dict(facecolor="yellow", alpha=0.5),
+            bbox=dict(facecolor="yellow", alpha=0.7),
         )
-
+    
     ax.axis("off")
+    plt.tight_layout()
     plt.show()
 
 
@@ -194,7 +210,7 @@ def draw_boxes(image, gt_boxes, pred_boxes, class_names):
 # ----------------------------------------------------------
 
 def load_config():
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     config_path = project_root / "configs" / "coco_multilabel_config.json"
     with open(config_path, "r") as f:
         return json.load(f), project_root
@@ -210,12 +226,22 @@ def main():
     image_size = tuple(config["image_size"])
     batch_size = config["batch_size"]
     val_split = config["val_split"]
+    
+    # Adjustable thresholds for evaluation
+    DETECTION_THRESHOLD = 0.5  # Threshold for decoding predictions
+    IOU_THRESHOLD_03 = 0.3  # IoU threshold for mAP@0.3
+    IOU_THRESHOLD_05 = 0.5  # IoU threshold for mAP@0.5
 
     model_name = config.get("detector_model_name", "coco_simple_detector")
     models_dir = project_root / config["models_dir"]
     model_path = models_dir / f"{model_name}_best.keras"
 
     print("Loading model:", model_path)
+    # Prepare custom objects for loading
+    custom_objects = {
+        "objectness_accuracy": objectness_accuracy,
+        "detection_loss": detection_loss,  # Legacy loss
+    }
     
     # Get loss parameters from config
     focal_gamma = config.get("focal_gamma", 2.0)
@@ -223,22 +249,15 @@ def main():
     positive_weight = config.get("positive_weight", 5.0)
     use_focal_loss = config.get("use_focal_loss", True)
     
-    # Prepare custom objects for loading
-    custom_objects = {
-        "objectness_accuracy": objectness_accuracy,
-        "detection_loss": detection_loss,  # Legacy loss
-    }
-    
-    # Add focal loss if it was used
-    if use_focal_loss:
-        loss_fn = DetectionLossFocal(
-            focal_gamma=focal_gamma, 
-            focal_alpha=focal_alpha,
-            positive_weight=positive_weight
-        )
-        custom_objects["DetectionLossFocal"] = DetectionLossFocal
-        custom_objects["detection_loss_focal"] = loss_fn
-    
+    # Always create loss function and component metrics (model may have been saved with these)
+    loss_fn = DetectionLossFocal(
+        focal_gamma=focal_gamma, 
+        focal_alpha=focal_alpha,
+        positive_weight=positive_weight
+    )
+    custom_objects["DetectionLossFocal"] = DetectionLossFocal
+    custom_objects["detection_loss_focal"] = loss_fn
+
     model = keras.models.load_model(
         model_path,
         custom_objects=custom_objects,
@@ -282,7 +301,6 @@ def main():
         if not use_tfrecords:
             # Fall back to JSON pipeline
             print(f"[CCT] Using JSON pipeline (slower)")
-            from cct_splits_utils import get_filelist_from_splits_or_config
             
             val_filelist = get_filelist_from_splits_or_config(config, "val", config["cct_annotations"])
             
@@ -305,7 +323,6 @@ def main():
     grid_size = infer_grid_size(image_size)
 
     # We need the encoder from train script
-    from train_simple_detector import make_grid_encoder
     encoder = make_grid_encoder(num_classes, grid_size)
 
     AUTOTUNE = tf.data.AUTOTUNE
@@ -320,22 +337,56 @@ def main():
     print(result)
 
     # ----------------------------------------------------------
-    # 2) Visualization
+    # 2) Collect predictions and ground truth for mAP computation
     # ----------------------------------------------------------
 
-    print("\n=== Visualizing a few predictions ===")
-
-    for (images, grid_true) in val_ds.take(3):
-        preds = model(images, training=False).numpy()
-
-        B = images.shape[0]
-
-        for i in range(B):
-            image = images[i].numpy()
-            grid_t = grid_true[i].numpy()
-            grid_p = preds[i]
-
-            # Extract ground-truth boxes
+    print("\n" + "=" * 60)
+    print("Evaluating model...")
+    print("=" * 60)
+    
+    # Collect predictions, ground truth, and images for visualization
+    predictions_list = []
+    ground_truth_list = []
+    images_list = []  # Store images for visualization
+    
+    for batch_idx, batch in enumerate(val_ds):
+        if isinstance(batch, tuple) and len(batch) == 2:
+            images, grid_true = batch
+        else:
+            continue
+        
+        # Get predictions
+        pred_grids = model(images, training=False)
+        
+        # Convert to numpy
+        pred_grids_np = pred_grids.numpy()
+        images_np = images.numpy()
+        grid_true_np = grid_true.numpy()
+        
+        # Decode predictions for each image in batch
+        batch_size_actual = pred_grids_np.shape[0]
+        for i in range(batch_size_actual):
+            pred_grid = pred_grids_np[i]  # [H, W, 5 + num_classes]
+            image_np = images_np[i]  # [H, W, 3]
+            grid_t = grid_true_np[i]  # [H, W, 5 + num_classes]
+            
+            # Convert image from normalized [0, 1] to [0, 255] uint8 if needed
+            if image_np.max() <= 1.0:
+                image_np = (image_np * 255).astype(np.uint8)
+            else:
+                image_np = image_np.astype(np.uint8)
+            
+            # Decode to boxes
+            pred_boxes = decode_predictions(
+                pred_grid,
+                num_classes=num_classes,
+                threshold=DETECTION_THRESHOLD,
+                nms_iou=0.5,
+                max_boxes=20,
+            )
+            predictions_list.append(pred_boxes)
+            
+            # Get ground truth boxes
             gt_boxes = []
             S = grid_size
             for gy in range(S):
@@ -348,13 +399,73 @@ def main():
                     ymin = cy - h/2
                     xmax = cx + w/2
                     ymax = cy + h/2
-                    gt_boxes.append([ymin, xmin, ymax, xmax])
+                    
+                    # Clip to [0, 1]
+                    xmin = np.clip(xmin, 0, 1)
+                    ymin = np.clip(ymin, 0, 1)
+                    xmax = np.clip(xmax, 0, 1)
+                    ymax = np.clip(ymax, 0, 1)
+                    
+                    # Get class
+                    class_probs = cell[5:]
+                    class_id = int(np.argmax(class_probs))
+                    
+                    gt_boxes.append({
+                        "bbox": [ymin, xmin, ymax, xmax],
+                        "class_id": class_id,
+                    })
+            
+            ground_truth_list.append(gt_boxes)
+            images_list.append(image_np)  # Store image for visualization
+        
+        # Limit evaluation to first few batches for speed
+        if batch_idx >= 10:
+            break
+    
+    # Compute mAP
+    print(f"\nEvaluated {len(predictions_list)} images")
+    map_3 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=IOU_THRESHOLD_03)
+    map_5 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=IOU_THRESHOLD_05)
+    
+    print(f"\nResults:")
+    print(f"  Threshold 0.3: {map_3:.4f}")
+    print(f"  Threshold 0.5: {map_5:.4f}")
+    
+    # Print some example predictions
+    print(f"\nExample predictions (first 5 images):")
+    for i in range(min(5, len(predictions_list))):
+        print(f"\nImage {i+1}:")
+        print(f"  GT boxes: {len(ground_truth_list[i])}")
+        print(f"  Pred boxes: {len(predictions_list[i])}")
+        if predictions_list[i]:
+            print(f"  Top prediction: class={predictions_list[i][0]['class_id']}, score={predictions_list[i][0]['score']:.3f}")
+    
+    # ----------------------------------------------------------
+    # 3) Visualization
+    # ----------------------------------------------------------
 
-            pred_boxes = decode_predictions(grid_p, num_classes, threshold=0.5, nms_iou=0.5, max_boxes=10)
-
-            draw_boxes(image, gt_boxes, pred_boxes, class_names)
-
-        break  # visualizing one batch is enough for now
+    print("\n" + "=" * 60)
+    print("Visualizing predictions...")
+    print("=" * 60)
+    
+    # Find images with predictions
+    images_with_predictions = []
+    for i, pred_boxes in enumerate(predictions_list):
+        if len(pred_boxes) > 0:
+            images_with_predictions.append(i)
+    
+    if len(images_with_predictions) == 0:
+        print("\nNo images with predicted boxes found. Model is not detecting any objects.")
+    else:
+        print(f"\nFound {len(images_with_predictions)} images with predictions. Showing first 5:")
+        for idx, img_idx in enumerate(images_with_predictions[:5]):
+            print(f"\nVisualizing image {img_idx + 1} (has {len(predictions_list[img_idx])} predicted boxes)")
+            draw_boxes(
+                images_list[img_idx],
+                ground_truth_list[img_idx],
+                predictions_list[img_idx],
+                class_names
+            )
 
 
 if __name__ == "__main__":

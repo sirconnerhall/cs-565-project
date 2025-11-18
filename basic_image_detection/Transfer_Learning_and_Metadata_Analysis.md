@@ -24,7 +24,7 @@ Train the **task-specific components** (detection head, metadata fusion) while p
 ```
 ┌─────────────────────────────────────┐
 │  Pre-trained Backbone (FROZEN)      │  ← No gradient updates
-│  (MobileNetV2, ResNet50, etc.)      │
+│  (MobileNetV2)      │
 └──────────────┬──────────────────────┘
                │
                ▼
@@ -69,7 +69,7 @@ Refine the **entire model** including the backbone to optimize for the specific 
 ```
 ┌─────────────────────────────────────┐
 │  Pre-trained Backbone (TRAINABLE)   │  ← Now receives gradient updates
-│  (MobileNetV2, ResNet50, etc.)      │
+│  (MobileNetV2)      │
 └──────────────┬──────────────────────┘
                │
                ▼

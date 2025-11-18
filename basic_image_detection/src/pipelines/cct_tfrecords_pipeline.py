@@ -10,7 +10,7 @@ from pathlib import Path
 
 import tensorflow as tf
 
-from cct_pipeline import CCTInfo, CCTLabelInfo
+from .cct_pipeline import CCTInfo, CCTLabelInfo
 
 
 def parse_tf_example(example_proto, image_size=None):

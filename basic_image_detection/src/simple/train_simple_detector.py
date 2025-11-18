@@ -1,31 +1,22 @@
-"""
-Train multimodal detection model for CCT dataset.
-
-Uses image + metadata (location, date, time) to improve detection accuracy.
-"""
-
 import json
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from keras import layers
+from keras import layers  # works with tf.keras in TF 2.10
 
-from coco_tfds_pipeline import make_coco_dataset
-from cct_pipeline import make_cct_dataset, load_cct_annotations, extract_cct_metadata_features
-from cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from train_simple_detector import infer_grid_size, make_grid_encoder
-from coco_multilabel_utils import run_extended_sanity_checks
-
+from ..pipelines.coco_tfds_pipeline import make_coco_dataset  # existing loader
+from ..pipelines.cct_pipeline import make_cct_dataset
+from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
+from ..pipelines.coco_multilabel_utils import run_extended_sanity_checks
 
 # ----------------------------
 # Config helpers
 # ----------------------------
 
 def load_config(config_name="coco_multilabel_config.json"):
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     config_path = project_root / "configs" / config_name
     with open(config_path, "r") as f:
         config = json.load(f)
@@ -33,33 +24,165 @@ def load_config(config_name="coco_multilabel_config.json"):
 
 
 # ----------------------------
-# Focal loss for objectness
+# Infer grid size from backbone
 # ----------------------------
 
-def focal_loss_objectness(gamma=2.0, alpha=0.25):
+def infer_grid_size(image_size):
     """
-    Focal loss for objectness predictions to handle class imbalance.
+    Use a MobileNetV2 backbone (no weights) to infer the spatial resolution
+    of the final feature map, given the input image size.
+
+    For typical sizes (e.g. 224x224), this will be image_size / 32.
     """
-    def _loss(y_true, y_pred):
-        # y_true, y_pred: [B, S, S, 1] (objectness)
-        eps = 1e-7
-        y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
+    h, w = image_size
+    dummy_input = keras.Input(shape=(h, w, 3))
+    base_model = keras.applications.MobileNetV2(
+        input_shape=(h, w, 3),
+        include_top=False,
+        weights=None,  # we just need the shape here
+    )
+
+    x = keras.applications.mobilenet_v2.preprocess_input(dummy_input)
+    feat = base_model(x)
+    grid_h = int(feat.shape[1])
+    grid_w = int(feat.shape[2])
+    assert grid_h == grid_w, "Expected square feature map for square inputs."
+    return grid_h
+
+
+# ----------------------------
+# Encode COCO boxes -> grid targets
+# ----------------------------
+
+def make_grid_encoder(num_classes, grid_size):
+    """
+    Map (images, targets) -> (images, grid_targets), where:
+
+        grid_targets: [B, S, S, 5 + C]
+            0: objectness (0 or 1)
+            1: cx (normalized 0-1)
+            2: cy
+            3: w
+            4: h
+            5..: one-hot class (length C)
+
+    We use tf.numpy_function for clarity: fine for a course project.
+    """
+
+    depth = 5 + num_classes
+
+    def _tf_fn(images, targets):
+        # images: [B, H, W, 3]
+        # targets["bboxes"]: [B, max_boxes, 4]
+        # targets["labels"]: [B, max_boxes]
+
+        def _np_encode(images_np, bboxes_np, labels_np):
+            """
+            NumPy-side implementation over the batch.
+            """
+            B = images_np.shape[0]
+            grid = np.zeros((B, grid_size, grid_size, depth), dtype=np.float32)
+
+            for b in range(B):
+                boxes = bboxes_np[b]      # [max_boxes, 4]
+                classes = labels_np[b]    # [max_boxes]
+
+                for box, cls in zip(boxes, classes):
+                    ymin, xmin, ymax, xmax = box
+
+                    # Skip padded / invalid boxes (zero area)
+                    if ymax <= ymin or xmax <= xmin:
+                        continue
+
+                    cx = (xmin + xmax) / 2.0
+                    cy = (ymin + ymax) / 2.0
+                    w = xmax - xmin
+                    h = ymax - ymin
+
+                    if w <= 0.0 or h <= 0.0:
+                        continue
+
+                    gx = int(cx * grid_size)
+                    gy = int(cy * grid_size)
+
+                    if gx < 0 or gx >= grid_size or gy < 0 or gy >= grid_size:
+                        continue
+
+                    cls_int = int(cls)
+                    if cls_int < 0 or cls_int >= num_classes:
+                        continue
+
+                    # If there's already an object in this cell, keep the larger one
+                    existing_obj = grid[b, gy, gx, 0]
+                    if existing_obj == 1.0:
+                        existing_w = grid[b, gy, gx, 3]
+                        existing_h = grid[b, gy, gx, 4]
+                        if w * h <= existing_w * existing_h:
+                            continue
+
+                    # Set objectness
+                    grid[b, gy, gx, 0] = 1.0
+                    # Bbox (normalized)
+                    grid[b, gy, gx, 1:5] = [cx, cy, w, h]
+                    # One-hot class
+                    grid[b, gy, gx, 5 + cls_int] = 1.0
+
+            return grid
+
+        # Ensure labels are int32 for consistency (CCT uses int32, COCO uses int64)
+        labels = tf.cast(targets["labels"], tf.int32)
         
-        # BCE
-        ce = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
-        
-        # p_t
-        p_t = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
-        
-        # alpha, modulating
-        alpha_factor = y_true * alpha + (1.0 - y_true) * (1.0 - alpha)
-        modulating_factor = tf.pow(1.0 - p_t, gamma)
-        
-        loss = alpha_factor * modulating_factor * ce
-        return tf.reduce_mean(loss)
-    
-    _loss.__name__ = "focal_loss_objectness"
-    return _loss
+        grid = tf.numpy_function(
+            _np_encode,
+            [images, targets["bboxes"], labels],
+            tf.float32,
+        )
+
+        # Set dynamic batch dim, fixed spatial dims and depth
+        grid.set_shape((None, grid_size, grid_size, depth))
+        return images, grid
+
+    return _tf_fn
+
+
+# ----------------------------
+# Simple detector model
+# ----------------------------
+
+def build_simple_detector(image_size, num_classes):
+    """
+    Simple grid-based detector on top of MobileNetV2.
+    Output shape: [B, S, S, 5 + C] with sigmoid activation.
+    """
+
+    h, w = image_size
+    inputs = keras.Input(shape=(h, w, 3), name="image")
+
+    base_model = keras.applications.MobileNetV2(
+        input_shape=(h, w, 3),
+        include_top=False,
+        weights="imagenet",
+    )
+    base_model.trainable = False  # start frozen; could fine-tune later
+
+    x = keras.applications.mobilenet_v2.preprocess_input(inputs)
+    x = base_model(x, training=False)
+
+    # A small conv head
+    x = layers.Conv2D(256, 3, padding="same", activation="relu")(x)
+    x = layers.Conv2D(128, 3, padding="same", activation="relu")(x)
+
+    # 5 + num_classes channels: [obj, cx, cy, w, h, class_probs...]
+    outputs = layers.Conv2D(
+        5 + num_classes,
+        1,
+        padding="same",
+        activation="sigmoid",  # all outputs in [0, 1]
+        name="grid_output",
+    )(x)
+
+    model = keras.Model(inputs, outputs, name="coco_simple_detector")
+    return model
 
 
 # ----------------------------
@@ -192,179 +315,37 @@ def make_component_loss_metrics(loss_fn):
     return [objectness_loss_metric, bbox_loss_metric, class_loss_metric]
 
 
-def detection_loss_focal(y_true, y_pred, focal_gamma=2.0, focal_alpha=0.25):
+# Legacy function for backward compatibility
+def detection_loss(y_true, y_pred):
     """
-    Combined loss with focal loss for objectness:
-      - objectness focal loss for all cells
-      - bbox MSE for cells with an object
-      - class BCE for cells with an object
-    
-    Shapes:
-        y_true, y_pred: [B, S, S, 5 + C]
+    Legacy simple detection loss (BCE for objectness).
+    Use DetectionLossFocal for better performance on imbalanced data.
     """
-    # Objectness with focal loss
+    # Objectness
     obj_true = y_true[..., 0:1]   # [B, S, S, 1]
     obj_pred = y_pred[..., 0:1]   # [B, S, S, 1]
-    
-    eps = 1e-7
-    obj_pred_clipped = tf.clip_by_value(obj_pred, eps, 1.0 - eps)
-    ce = -(obj_true * tf.math.log(obj_pred_clipped) + 
-           (1.0 - obj_true) * tf.math.log(1.0 - obj_pred_clipped))
-    p_t = obj_true * obj_pred_clipped + (1.0 - obj_true) * (1.0 - obj_pred_clipped)
-    alpha_factor = obj_true * focal_alpha + (1.0 - obj_true) * (1.0 - focal_alpha)
-    modulating_factor = tf.pow(1.0 - p_t, focal_gamma)
-    obj_loss = alpha_factor * modulating_factor * ce
-    
+    obj_loss = tf.keras.backend.binary_crossentropy(obj_true, obj_pred)
+
     # Bboxes (only where there is an object)
     box_true = y_true[..., 1:5]   # [B, S, S, 4]
     box_pred = y_pred[..., 1:5]   # [B, S, S, 4]
     box_diff = box_true - box_pred
     box_sq = tf.square(box_diff)
-    box_loss = tf.reduce_sum(box_sq, axis=-1, keepdims=True)  # [B, S, S, 1]
-    box_loss = box_loss * obj_true  # Mask by objectness
-    
+    box_loss = tf.reduce_sum(box_sq, axis=-1, keepdims=True)
+    box_loss = box_loss * obj_true
+
     # Classes (only where there is an object)
     cls_true = y_true[..., 5:]   # [B, S, S, C]
     cls_pred = y_pred[..., 5:]   # [B, S, S, C]
     cls_bce = tf.keras.backend.binary_crossentropy(cls_true, cls_pred)
-    cls_loss = tf.reduce_mean(cls_bce, axis=-1, keepdims=True)  # [B, S, S, 1]
-    cls_loss = cls_loss * obj_true  # Mask by objectness
-    
-    # Sum all three terms
+    cls_loss = tf.reduce_mean(cls_bce, axis=-1, keepdims=True)
+    cls_loss = cls_loss * obj_true
+
     total = obj_loss + box_loss + cls_loss
     return tf.reduce_mean(total)
 
-
 # ----------------------------
-# Extract metadata from samples
-# ----------------------------
-
-def extract_metadata_batch(samples_batch):
-    """
-    Extract metadata features from a batch of samples.
-    
-    Args:
-        samples_batch: List of sample dicts with location, date_captured
-    
-    Returns:
-        [B, metadata_dim] numpy array
-    """
-    metadata_list = []
-    for sample in samples_batch:
-        metadata = extract_cct_metadata_features(sample)
-        metadata_list.append(metadata)
-    return np.array(metadata_list, dtype=np.float32)
-
-
-def add_metadata_to_dataset(ds, samples, metadata_dim=5):
-    """
-    Add metadata to dataset by mapping samples to metadata features.
-    
-    Args:
-        ds: Dataset yielding (images, targets)
-        samples: List of sample dicts
-        metadata_dim: Dimension of metadata vector
-    
-    Returns:
-        Dataset yielding ((images, metadata), targets)
-    """
-    # Create mapping from index to metadata
-    metadata_array = np.array([extract_cct_metadata_features(s) for s in samples], dtype=np.float32)
-    
-    def _add_metadata(images, targets):
-        # Get batch size
-        batch_size = tf.shape(images)[0]
-        
-        # For simplicity, we'll use a fixed metadata vector per batch
-        # In practice, you'd need to track which samples are in each batch
-        # This is a simplified version - for production, use dataset.enumerate() or similar
-        metadata_batch = tf.constant(metadata_array[:batch_size], dtype=tf.float32)
-        if tf.shape(metadata_batch)[0] < batch_size:
-            # Pad if needed
-            padding = tf.zeros((batch_size - tf.shape(metadata_batch)[0], metadata_dim), dtype=tf.float32)
-            metadata_batch = tf.concat([metadata_batch, padding], axis=0)
-        
-        return (images, metadata_batch), targets
-    
-    return ds.map(_add_metadata, num_parallel_calls=tf.data.AUTOTUNE)
-
-
-# ----------------------------
-# Multimodal detection model
-# ----------------------------
-
-def build_multimodal_detector(image_size, num_classes, metadata_dim=5):
-    """
-    Build multimodal detection model.
-    
-    Image branch: MobileNetV2 → feature map (spatial dimensions preserved)
-    Metadata branch: Dense layers
-    Fusion: Metadata features injected into image features via FiLM-like conditioning
-    
-    Output: [B, S, S, 5 + C] grid predictions
-    """
-    h, w = image_size
-    grid_size = infer_grid_size(image_size)
-    
-    # Image input
-    image_input = keras.Input(shape=(h, w, 3), name="image")
-    
-    # Image branch (keep spatial dimensions)
-    base_model = keras.applications.MobileNetV2(
-        input_shape=(h, w, 3),
-        include_top=False,
-        weights="imagenet",
-    )
-    base_model.trainable = False  # Start frozen
-    
-    x_img = keras.applications.mobilenet_v2.preprocess_input(image_input)
-    x_img = base_model(x_img, training=False)  # [B, H', W', C']
-    
-    # Metadata input
-    metadata_input = keras.Input(shape=(metadata_dim,), name="metadata")
-    
-    # Metadata branch
-    x_meta = layers.Dense(64, activation="relu")(metadata_input)
-    x_meta = layers.Dense(32, activation="relu")(x_meta)
-    x_meta = layers.Dense(16, activation="relu")(x_meta)  # [B, 16]
-    
-    # Expand metadata to spatial dimensions for FiLM-like conditioning
-    # Get spatial dimensions from image features
-    _, h_feat, w_feat, c_feat = x_img.shape
-    x_meta_expanded = layers.Dense(c_feat * 2)(x_meta)  # [B, C' * 2]
-    x_meta_expanded = tf.reshape(x_meta_expanded, [-1, 1, 1, c_feat * 2])  # [B, 1, 1, C' * 2]
-    x_meta_expanded = tf.tile(x_meta_expanded, [1, h_feat, w_feat, 1])  # [B, H', W', C' * 2]
-    
-    # Split into scale and shift (FiLM conditioning)
-    scale = x_meta_expanded[..., :c_feat]  # [B, H', W', C']
-    shift = x_meta_expanded[..., c_feat:]  # [B, H', W', C']
-    
-    # Apply FiLM conditioning
-    x_img = x_img * (1.0 + scale) + shift
-    
-    # Detection head
-    x = layers.Conv2D(256, 3, padding="same", activation="relu")(x_img)
-    x = layers.Conv2D(128, 3, padding="same", activation="relu")(x)
-    
-    # Output: [B, S, S, 5 + C]
-    outputs = layers.Conv2D(
-        5 + num_classes,
-        1,
-        padding="same",
-        activation="sigmoid",
-        name="grid_output",
-    )(x)
-    
-    model = keras.Model(
-        inputs=[image_input, metadata_input],
-        outputs=outputs,
-        name="cct_multimodal_detector",
-    )
-    return model
-
-
-# ----------------------------
-# Objectness accuracy metric
+# Simple objectness accuracy metric
 # ----------------------------
 
 def objectness_accuracy(y_true, y_pred):
@@ -407,20 +388,12 @@ class PredictionStats(keras.callbacks.Callback):
                 # Get one batch from validation set
                 val_batch = next(iter(self.val_dataset))
                 if isinstance(val_batch, tuple) and len(val_batch) == 2:
-                    inputs, targets = val_batch
-                    if isinstance(inputs, tuple):
-                        images, metadata = inputs
-                    else:
-                        images = inputs
-                        metadata = None
+                    images, targets = val_batch
                 else:
                     return
                 
                 # Get predictions
-                if metadata is not None:
-                    predictions = self.model([images, metadata], training=False)
-                else:
-                    predictions = self.model(images, training=False)
+                predictions = self.model(images, training=False)
                 
                 # Convert to numpy for analysis
                 pred_np = predictions.numpy()  # [B, S, S, 5+C]
@@ -501,8 +474,9 @@ class PredictionStats(keras.callbacks.Callback):
 # ----------------------------
 
 def main():
+    # Load config (reuse your existing coco_multilabel_config.json)
     config, project_root = load_config("coco_multilabel_config.json")
-    
+
     image_size = tuple(config["image_size"])
     batch_size = config["batch_size"]
     epochs = config["epochs"]
@@ -510,55 +484,51 @@ def main():
     val_split = config["val_split"]
     learning_rate = config["learning_rate"]
     models_dir = project_root / config["models_dir"]
-    
-    model_name = config.get("detector_model_name", "cct_multimodal_detector")
+
+    # Optional: detector-specific model name in config; else fallback
+    model_name = config.get("detector_model_name", "coco_simple_detector")
     focal_gamma = config.get("focal_gamma", 2.0)
     focal_alpha = config.get("focal_alpha", 0.5)  # Increased default for imbalanced data
     positive_weight = config.get("positive_weight", 5.0)  # Additional weight for positive examples
     filter_empty_images = config.get("filter_empty_images", False)  # Option to filter empty images
-    
+    use_focal_loss = config.get("use_focal_loss", True)  # Use focal loss by default
+
     models_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print("Project root:", project_root)
+    print("Train split:", train_split)
+    print("Val split:  ", val_split)
     print("Image size: ", image_size)
-    print("Focal loss: gamma={}, alpha={}".format(focal_gamma, focal_alpha))
+    if use_focal_loss:
+        print(f"Focal loss: gamma={focal_gamma}, alpha={focal_alpha}, positive_weight={positive_weight}")
+    if filter_empty_images:
+        print("Filtering empty images (images with no bboxes)")
+
+    # Use your existing COCO pipeline (with padded boxes & labels)
     
-    dataset_name = config.get("dataset", "cct")
-    metadata_dim = 5  # location_id, hour, day_of_week, month, brightness
-    
-    if dataset_name == "cct":
-        # Load samples for metadata extraction
-        from cct_splits_utils import get_filelist_from_splits_or_config
-        
-        train_filelist = get_filelist_from_splits_or_config(config, "train", config["cct_annotations"])
-        val_filelist = get_filelist_from_splits_or_config(config, "val", config["cct_annotations"])
-        
-        samples_train, _ = load_cct_annotations(
-            metadata_path=config["cct_annotations"],
-            bboxes_path=config["cct_bb_annotations"],
-            images_root=config["cct_images_root"],
-            filelist_path=train_filelist,
-            filter_empty=filter_empty_images,
+    dataset_name = config.get("dataset", "coco")
+
+    if dataset_name == "coco":
+        train_ds_raw, train_info = make_coco_dataset(
+            split=train_split,
+            batch_size=batch_size,
+            image_size=image_size,
         )
-        samples_val, _ = load_cct_annotations(
-            metadata_path=config["cct_annotations"],
-            bboxes_path=config["cct_bb_annotations"],
-            images_root=config["cct_images_root"],
-            filelist_path=val_filelist,
-            filter_empty=filter_empty_images,
+        val_ds_raw, val_info = make_coco_dataset(
+            split=val_split,
+            batch_size=batch_size,
+            image_size=image_size,
         )
-        
-        if filter_empty_images:
-            print(f"[Dataset] Filtered empty images: {len(samples_train)} train, {len(samples_val)} val samples with objects")
-        
-        # Check for TFRecords
+    elif dataset_name == "cct":
+        # Check if TFRecords are available (preferred for speed)
         use_tfrecords = config.get("cct_use_tfrecords", True)
         cct_tfrecords_dir = config.get("cct_tfrecords_dir")
         
         if use_tfrecords and cct_tfrecords_dir:
             from pathlib import Path
-            if Path(cct_tfrecords_dir).exists():
-                print(f"[CCT] Using TFRecords from {cct_tfrecords_dir}")
+            tfrecords_dir = Path(cct_tfrecords_dir)
+            if tfrecords_dir.exists():
+                print(f"[CCT] Using TFRecords from {tfrecords_dir}")
                 train_ds_raw, train_info = make_cct_tfrecords_dataset(
                     tfrecords_dir=cct_tfrecords_dir,
                     split="train",
@@ -574,15 +544,19 @@ def main():
                     shuffle=False,
                 )
             else:
+                print(f"[CCT] Warning: TFRecords directory not found: {tfrecords_dir}")
+                print(f"[CCT] Falling back to JSON pipeline")
                 use_tfrecords = False
+        else:
+            use_tfrecords = False
         
         if not use_tfrecords:
-            print(f"[CCT] Using JSON pipeline")
-            # train_filelist and val_filelist already set above
-            if train_filelist is None:
-                train_filelist = get_filelist_from_splits_or_config(config, "train", config["cct_annotations"])
-            if val_filelist is None:
-                val_filelist = get_filelist_from_splits_or_config(config, "val", config["cct_annotations"])
+            # Fall back to JSON pipeline
+            print(f"[CCT] Using JSON pipeline (slower)")
+            from cct_splits_utils import get_filelist_from_splits_or_config
+            
+            train_filelist = get_filelist_from_splits_or_config(config, "train", config["cct_annotations"])
+            val_filelist = get_filelist_from_splits_or_config(config, "val", config["cct_annotations"])
             
             train_ds_raw, train_info = make_cct_dataset(
                 images_root=config["cct_images_root"],
@@ -594,6 +568,7 @@ def main():
                 image_size=image_size,
                 filter_empty=filter_empty_images,
             )
+
             val_ds_raw, val_info = make_cct_dataset(
                 images_root=config["cct_images_root"],
                 metadata_path=config["cct_annotations"],
@@ -605,117 +580,69 @@ def main():
                 shuffle=False,
                 filter_empty=filter_empty_images,
             )
+        
+        # Ensure both datasets use the same num_classes (from train_info)
+        # This is important because both should have the same category mapping
+        if train_info.features["objects"]["label"].num_classes != val_info.features["objects"]["label"].num_classes:
+            raise ValueError(
+                f"Train and val datasets have different num_classes: "
+                f"{train_info.features['objects']['label'].num_classes} vs "
+                f"{val_info.features['objects']['label'].num_classes}"
+            )
     else:
-        raise ValueError(f"Multimodal detector currently only supports CCT dataset")
-    
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
     num_classes = train_info.features["objects"]["label"].num_classes
-    print(f"{dataset_name.upper()} num classes: {num_classes}")
-    
+    print(f"{dataset_name.upper()} num classes (detector):", num_classes)
+
+    # Infer grid size from the backbone stride
     grid_size = infer_grid_size(image_size)
     print("Grid size (SxS):", grid_size, "x", grid_size)
-    
-    # Pre-extract metadata from samples
-    # Note: This only works with JSON pipeline, not TFRecords
-    # For TFRecords, metadata would need to be stored in the records
-    if not use_tfrecords:
-        print("[Metadata] Extracting metadata from samples...")
-        train_metadata_array = np.array([extract_cct_metadata_features(s) for s in samples_train], dtype=np.float32)
-        val_metadata_array = np.array([extract_cct_metadata_features(s) for s in samples_val], dtype=np.float32)
-        print(f"[Metadata] Extracted metadata for {len(train_metadata_array)} train and {len(val_metadata_array)} val samples")
-        
-        # Create metadata datasets - need to unbatch image dataset first to align properly
-        # Then we'll batch both together
-        train_ds_unbatched = train_ds_raw.unbatch()
-        val_ds_unbatched = val_ds_raw.unbatch()
-        
-        train_metadata_ds = tf.data.Dataset.from_tensor_slices(train_metadata_array)
-        val_metadata_ds = tf.data.Dataset.from_tensor_slices(val_metadata_array)
-        
-        # Zip before batching to keep alignment
-        train_ds_zipped = tf.data.Dataset.zip((train_ds_unbatched, train_metadata_ds))
-        val_ds_zipped = tf.data.Dataset.zip((val_ds_unbatched, val_metadata_ds))
-    else:
-        # For TFRecords, use placeholder metadata (location/time would need to be in TFRecords)
-        print("[Metadata] Using placeholder metadata for TFRecords (location/time not available)")
-        def add_placeholder_metadata(images, targets):
-            batch_size = tf.shape(images)[0]
-            brightness = tf.reduce_mean(images, axis=[1, 2, 3])
-            location_id = tf.zeros([batch_size], dtype=tf.float32)
-            hour = tf.ones([batch_size], dtype=tf.float32) * 0.5
-            day_of_week = tf.ones([batch_size], dtype=tf.float32) * 0.5
-            month = tf.ones([batch_size], dtype=tf.float32) * 0.5
-            metadata = tf.stack([location_id, hour, day_of_week, month, brightness], axis=1)
-            return (images, metadata), targets
-        
-        train_ds_zipped = train_ds_raw.map(add_placeholder_metadata, num_parallel_calls=tf.data.AUTOTUNE)
-        val_ds_zipped = val_ds_raw.map(add_placeholder_metadata, num_parallel_calls=tf.data.AUTOTUNE)
-    
-    if not use_tfrecords:
-        def combine_metadata(images_targets, metadata):
-            images, targets = images_targets
-            # Compute brightness from images (override the placeholder)
-            brightness = tf.reduce_mean(images, axis=[1, 2, 3])  # scalar or [B]
-            
-            # Handle both batched and unbatched cases
-            if len(brightness.shape) == 0:
-                brightness = tf.expand_dims(brightness, 0)
-            
-            # Update brightness in metadata (last element)
-            metadata_updated = tf.concat([
-                metadata[:4] if len(metadata.shape) == 1 else metadata[:, :4],  # location_id, hour, day_of_week, month
-                tf.expand_dims(brightness, -1)  # brightness
-            ], axis=-1)
-            
-            return (images, metadata_updated), targets
-        
-        train_ds_with_meta = train_ds_zipped.map(combine_metadata, num_parallel_calls=tf.data.AUTOTUNE)
-        val_ds_with_meta = val_ds_zipped.map(combine_metadata, num_parallel_calls=tf.data.AUTOTUNE)
-        
-        # Batch after combining, shuffle training data
-        train_ds_with_meta = train_ds_with_meta.shuffle(1024).batch(batch_size)
-        val_ds_with_meta = val_ds_with_meta.batch(batch_size)
-    else:
-        # Already has metadata added
-        train_ds_with_meta = train_ds_zipped
-        val_ds_with_meta = val_ds_zipped
-    
-    # Encode to grid format
+
+    AUTOTUNE = tf.data.AUTOTUNE
+
     encoder = make_grid_encoder(num_classes, grid_size)
-    
-    def encode_with_metadata(inputs, targets):
-        images, metadata = inputs
-        images_encoded, grid_targets = encoder(images, targets)
-        return (images_encoded, metadata), grid_targets
-    
-    train_ds = train_ds_with_meta.map(encode_with_metadata, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    val_ds = val_ds_with_meta.map(encode_with_metadata, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    
-    # Build model
-    model = build_multimodal_detector(image_size, num_classes, metadata_dim)
-    model.summary()
-    
-    # Compile with focal loss
-    # Use the class-based loss for proper serialization
-    # For severe imbalance, use higher alpha and positive_weight
-    loss_fn = DetectionLossFocal(
-        focal_gamma=focal_gamma, 
-        focal_alpha=focal_alpha,
-        positive_weight=positive_weight
+
+    train_ds = (
+        train_ds_raw
+        .map(encoder, num_parallel_calls=AUTOTUNE)
+        .prefetch(AUTOTUNE)
     )
-    print(f"[Loss] Using focal loss: gamma={focal_gamma}, alpha={focal_alpha}, positive_weight={positive_weight}")
-    
-    # Create per-component loss metrics
-    component_metrics = make_component_loss_metrics(loss_fn)
+    val_ds = (
+        val_ds_raw
+        .map(encoder, num_parallel_calls=AUTOTUNE)
+        .prefetch(AUTOTUNE)
+    )
+
+    # Build model
+    model = build_simple_detector(image_size, num_classes)
+    model.summary()
+
+    # Compile with appropriate loss
+    if use_focal_loss:
+        loss_fn = DetectionLossFocal(
+            focal_gamma=focal_gamma, 
+            focal_alpha=focal_alpha,
+            positive_weight=positive_weight
+        )
+        print(f"[Loss] Using focal loss: gamma={focal_gamma}, alpha={focal_alpha}, positive_weight={positive_weight}")
+        # Create per-component loss metrics
+        component_metrics = make_component_loss_metrics(loss_fn)
+        metrics = [objectness_accuracy] + component_metrics
+    else:
+        loss_fn = detection_loss
+        print("[Loss] Using simple BCE loss (legacy)")
+        metrics = [objectness_accuracy]
     
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss=loss_fn,
-        metrics=[objectness_accuracy] + component_metrics,
+        metrics=metrics,
     )
-    
+
     best_model_path = models_dir / f"{model_name}_best.keras"
     last_model_path = models_dir / f"{model_name}_last.keras"
-    
+
     callbacks = [
         keras.callbacks.ModelCheckpoint(
             filepath=str(best_model_path),
@@ -741,14 +668,24 @@ def main():
         PredictionStats(threshold=0.5, val_dataset=val_ds, num_classes=num_classes, grid_size=grid_size),
     ]
     
-    print("\n=== Training multimodal detector ===")
+    # Extended sanity check
+    run_extended_sanity_checks(
+        train_ds_raw=train_ds_raw,
+        train_ds=train_ds,
+        num_classes=num_classes,
+        image_size=image_size,
+        grid_size=grid_size,
+        model=model,
+    )
+
+    print("\n=== Training simple grid-based detector ===")
     model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=epochs,
         callbacks=callbacks,
     )
-    
+
     model.save(str(last_model_path))
     print(f"\nSaved last model to {last_model_path}")
     print(f"Best model (by val_loss) at {best_model_path}")
@@ -756,4 +693,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

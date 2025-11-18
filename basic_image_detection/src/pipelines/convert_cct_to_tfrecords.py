@@ -14,7 +14,7 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image
 
-from cct_pipeline import load_cct_annotations
+from .cct_pipeline import load_cct_annotations
 
 
 def load_cct_splits(splits_path: str):

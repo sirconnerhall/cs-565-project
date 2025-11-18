@@ -11,11 +11,11 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from cct_pipeline import make_cct_dataset, load_cct_annotations, extract_cct_metadata_features
-from cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from build_yolo_detector import build_ssd_detector_with_metadata
-from cct_splits_utils import get_filelist_from_splits_or_config
-from train_cct_multimodal_detector import (
+from ..pipelines.cct_pipeline import make_cct_dataset, load_cct_annotations, extract_cct_metadata_features
+from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
+from .build_yolo_detector import build_ssd_detector_with_metadata
+from ..pipelines.cct_splits_utils import get_filelist_from_splits_or_config
+from ..utils.detection_utils import (
     DetectionLossFocal,
     make_component_loss_metrics,
     objectness_accuracy,
@@ -24,7 +24,7 @@ from train_cct_multimodal_detector import (
 
 
 def load_config(config_name="coco_multilabel_config.json"):
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     config_path = project_root / "configs" / config_name
     with open(config_path, "r") as f:
         config = json.load(f)

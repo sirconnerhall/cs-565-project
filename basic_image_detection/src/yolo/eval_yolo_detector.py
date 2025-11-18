@@ -11,16 +11,15 @@ from tensorflow import keras
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from cct_pipeline import make_cct_dataset, load_cct_annotations, extract_cct_metadata_features
-from cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from build_yolo_detector import build_ssd_detector_with_metadata
-from train_cct_multimodal_detector import DetectionLossFocal, objectness_accuracy, make_component_loss_metrics
-from detection_utils import decode_predictions_grid, compute_map
-from cct_splits_utils import get_filelist_from_splits_or_config
+from ..pipelines.cct_pipeline import make_cct_dataset, load_cct_annotations, extract_cct_metadata_features
+from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
+from .build_yolo_detector import build_ssd_detector_with_metadata
+from ..utils.detection_utils import decode_predictions_grid, compute_map, DetectionLossFocal, objectness_accuracy, make_component_loss_metrics
+from ..pipelines.cct_splits_utils import get_filelist_from_splits_or_config
 
 
 def load_config():
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     config_path = project_root / "configs" / "coco_multilabel_config.json"
     
     with open(config_path, "r") as f:
@@ -255,8 +254,8 @@ def main():
             pred_boxes = decode_predictions_grid(
                 pred_grid,
                 num_classes=num_classes,
-                threshold=0.5,
-                nms_iou=0.5,
+                threshold=0.001,
+                nms_iou=0.8,
                 max_boxes=20,
             )
             predictions_list.append(pred_boxes)
@@ -283,13 +282,13 @@ def main():
     
     # Compute mAP
     print(f"\nEvaluated {len(predictions_list)} images")
-    map_50 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.5)
-    map_75 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.75)
+    map_5 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.5)
+    map_8 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.8)
     
     print(f"\nResults:")
-    print(f"  mAP@0.5: {map_50:.4f}")
-    print(f"  mAP@0.75: {map_75:.4f}")
-    
+    print(f"Mean Average Precision at IoU threshold 0.5: {map_5:.4f}")
+    print(f"Mean Average Precision at IoU threshold 0.8: {map_8:.4f}")
+    """
     # Print some example predictions
     print(f"\nExample predictions (first 5 images):")
     for i in range(min(5, len(predictions_list))):
@@ -303,19 +302,19 @@ def main():
     print("\n" + "=" * 60)
     print("Visualizing predictions...")
     print("=" * 60)
-    
+    """
     # Find images with predictions
     images_with_predictions = []
-    for i, pred_boxes in enumerate(predictions_list):
+    for i, pred_boxes in enumerate(ground_truth_list):
         if len(pred_boxes) > 0:
             images_with_predictions.append(i)
     
     if len(images_with_predictions) == 0:
         print("\nNo images with predicted boxes found. Model is not detecting any objects.")
     else:
-        print(f"\nFound {len(images_with_predictions)} images with predictions. Showing first 5:")
+        print(f"\nShowing first 5 examples of with ground truth boxes:")
         for idx, img_idx in enumerate(images_with_predictions[:5]):
-            print(f"\nVisualizing image {img_idx + 1} (has {len(predictions_list[img_idx])} predicted boxes)")
+            print(f"\nVisualizing image {img_idx + 1}")
             draw_boxes(
                 images_list[img_idx],
                 ground_truth_list[img_idx],

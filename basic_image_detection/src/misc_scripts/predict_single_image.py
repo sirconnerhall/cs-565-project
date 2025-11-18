@@ -36,7 +36,7 @@ def main():
     # -----------------------------
     # Locate config and model
     # -----------------------------
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     config_path = project_root / "configs" / "coco_multilabel_config.json"
     config = load_config(str(config_path))
 
