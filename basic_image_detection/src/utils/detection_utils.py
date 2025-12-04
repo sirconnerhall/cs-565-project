@@ -312,12 +312,14 @@ class DetectionLossFocal(keras.losses.Loss):
     - Higher focal_alpha (0.5-0.75) to weight positive examples more
     - Higher positive_weight (2.0-10.0) to further emphasize objects
     - Higher focal_gamma (2.0-3.0) to focus on hard negatives
+    - Higher bbox_loss_weight (5.0-20.0) to emphasize accurate box regression
     """
-    def __init__(self, focal_gamma=2.0, focal_alpha=0.5, positive_weight=5.0, name="detection_loss_focal", **kwargs):
+    def __init__(self, focal_gamma=2.0, focal_alpha=0.5, positive_weight=5.0, bbox_loss_weight=10.0, name="detection_loss_focal", **kwargs):
         super().__init__(name=name, **kwargs)
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
         self.positive_weight = positive_weight  # Additional weight for positive examples
+        self.bbox_loss_weight = bbox_loss_weight  # Weight for bbox regression loss
     
     def call(self, y_true, y_pred):
         """Compute the loss."""
@@ -344,12 +346,56 @@ class DetectionLossFocal(keras.losses.Loss):
         obj_loss = alpha_factor * modulating_factor * ce * weight_factor
         
         # Bboxes (only where there is an object)
-        box_true = y_true[..., 1:5]   # [B, S, S, 4]
-        box_pred = y_pred[..., 1:5]   # [B, S, S, 4]
-        box_diff = box_true - box_pred
-        box_sq = tf.square(box_diff)
-        box_loss = tf.reduce_sum(box_sq, axis=-1, keepdims=True)  # [B, S, S, 1]
+        box_true = y_true[..., 1:5]   # [B, S, S, 4] - [cx, cy, w, h]
+        box_pred = y_pred[..., 1:5]   # [B, S, S, 4] - [cx, cy, w, h]
+        
+        # Convert to corner format for IoU computation
+        # True boxes
+        cx_true, cy_true, w_true, h_true = tf.split(box_true, 4, axis=-1)
+        xmin_true = cx_true - w_true / 2.0
+        ymin_true = cy_true - h_true / 2.0
+        xmax_true = cx_true + w_true / 2.0
+        ymax_true = cy_true + h_true / 2.0
+        
+        # Predicted boxes
+        cx_pred, cy_pred, w_pred, h_pred = tf.split(box_pred, 4, axis=-1)
+        xmin_pred = cx_pred - w_pred / 2.0
+        ymin_pred = cy_pred - h_pred / 2.0
+        xmax_pred = cx_pred + w_pred / 2.0
+        ymax_pred = cy_pred + h_pred / 2.0
+        
+        # Clip to [0, 1]
+        xmin_true = tf.clip_by_value(xmin_true, 0.0, 1.0)
+        ymin_true = tf.clip_by_value(ymin_true, 0.0, 1.0)
+        xmax_true = tf.clip_by_value(xmax_true, 0.0, 1.0)
+        ymax_true = tf.clip_by_value(ymax_true, 0.0, 1.0)
+        xmin_pred = tf.clip_by_value(xmin_pred, 0.0, 1.0)
+        ymin_pred = tf.clip_by_value(ymin_pred, 0.0, 1.0)
+        xmax_pred = tf.clip_by_value(xmax_pred, 0.0, 1.0)
+        ymax_pred = tf.clip_by_value(ymax_pred, 0.0, 1.0)
+        
+        # Compute IoU
+        inter_xmin = tf.maximum(xmin_true, xmin_pred)
+        inter_ymin = tf.maximum(ymin_true, ymin_pred)
+        inter_xmax = tf.minimum(xmax_true, xmax_pred)
+        inter_ymax = tf.minimum(ymax_true, ymax_pred)
+        
+        inter_w = tf.maximum(0.0, inter_xmax - inter_xmin)
+        inter_h = tf.maximum(0.0, inter_ymax - inter_ymin)
+        inter_area = inter_w * inter_h
+        
+        area_true = (xmax_true - xmin_true) * (ymax_true - ymin_true)
+        area_pred = (xmax_pred - xmin_pred) * (ymax_pred - ymin_pred)
+        union_area = area_true + area_pred - inter_area
+        
+        # IoU with small epsilon to avoid division by zero
+        eps = 1e-7
+        iou = inter_area / (union_area + eps)
+        
+        # Use 1 - IoU as loss (higher IoU = lower loss)
+        box_loss = (1.0 - iou)  # [B, S, S, 1]
         box_loss = box_loss * obj_true  # Mask by objectness
+        box_loss = box_loss * self.bbox_loss_weight  # Apply bbox loss weight
         
         # Classes (only where there is an object)
         cls_true = y_true[..., 5:]   # [B, S, S, C]
@@ -367,6 +413,7 @@ class DetectionLossFocal(keras.losses.Loss):
             "focal_gamma": self.focal_gamma,
             "focal_alpha": self.focal_alpha,
             "positive_weight": self.positive_weight,
+            "bbox_loss_weight": self.bbox_loss_weight,
         }
 
 

@@ -1,0 +1,42 @@
+[
+  {
+    "model": "SSNM",
+    "mAP@0.3": 0.0,
+    "mAP@0.5": 0.0,
+    "mAP@0.8": 0.0,
+    "total_gt_boxes": 0,
+    "total_pred_boxes": 25,
+    "avg_pred_per_image": 0.078125,
+    "avg_gt_per_image": 0.0
+  },
+  {
+    "model": "SSM",
+    "mAP@0.3": 0.0,
+    "mAP@0.5": 0.0,
+    "mAP@0.8": 0.0,
+    "total_gt_boxes": 0,
+    "total_pred_boxes": 9,
+    "avg_pred_per_image": 0.028125,
+    "avg_gt_per_image": 0.0
+  },
+  {
+    "model": "TSNM",
+    "mAP@0.3": 0.0,
+    "mAP@0.5": 0.0,
+    "mAP@0.8": 0.0,
+    "total_gt_boxes": 0,
+    "total_pred_boxes": 2900,
+    "avg_pred_per_image": 9.0625,
+    "avg_gt_per_image": 0.0
+  },
+  {
+    "model": "TSM",
+    "mAP@0.3": 0.0,
+    "mAP@0.5": 0.0,
+    "mAP@0.8": 0.0,
+    "total_gt_boxes": 0,
+    "total_pred_boxes": 255,
+    "avg_pred_per_image": 0.796875,
+    "avg_gt_per_image": 0.0
+  }
+]

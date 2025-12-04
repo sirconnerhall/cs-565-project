@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from .build_yolo_detector import build_ssd_detector_with_metadata
+from .build_detector import build_ssd_detector_with_metadata
 from ..utils.detection_utils import decode_predictions_grid, compute_map, compute_iou, DetectionLossFocal, objectness_accuracy, make_component_loss_metrics
 
 
@@ -90,7 +90,8 @@ def main():
     image_size = tuple(config["image_size"])
     batch_size = config["batch_size"]
     
-    model_name = config.get("detector_model_name", "yolo_detector")
+    # Model name is set here, not from config
+    model_name = "TSM"
     models_dir = project_root / config["models_dir"]
     model_path = models_dir / f"{model_name}_best.keras"
     

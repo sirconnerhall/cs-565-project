@@ -7,7 +7,6 @@ from tensorflow import keras
 from keras import layers  # works with tf.keras in TF 2.10
 
 from ..pipelines.coco_tfds_pipeline import make_coco_dataset  # existing loader
-from ..pipelines.cct_pipeline import make_cct_dataset
 from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
 from ..pipelines.coco_multilabel_utils import run_extended_sanity_checks
 
@@ -15,7 +14,7 @@ from ..pipelines.coco_multilabel_utils import run_extended_sanity_checks
 # Config helpers
 # ----------------------------
 
-def load_config(config_name="coco_multilabel_config.json"):
+def load_config(config_name="config.json"):
     project_root = Path(__file__).resolve().parents[2]
     config_path = project_root / "configs" / config_name
     with open(config_path, "r") as f:
@@ -198,12 +197,14 @@ class DetectionLossFocal(keras.losses.Loss):
     - Higher focal_alpha (0.5-0.75) to weight positive examples more
     - Higher positive_weight (2.0-10.0) to further emphasize objects
     - Higher focal_gamma (2.0-3.0) to focus on hard negatives
+    - Higher bbox_loss_weight (5.0-20.0) to emphasize accurate box regression
     """
-    def __init__(self, focal_gamma=2.0, focal_alpha=0.5, positive_weight=5.0, name="detection_loss_focal", **kwargs):
+    def __init__(self, focal_gamma=2.0, focal_alpha=0.5, positive_weight=5.0, bbox_loss_weight=10.0, name="detection_loss_focal", **kwargs):
         super().__init__(name=name, **kwargs)
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
         self.positive_weight = positive_weight  # Additional weight for positive examples
+        self.bbox_loss_weight = bbox_loss_weight  # Weight for bbox regression loss
     
     def call(self, y_true, y_pred):
         """Compute the loss."""
@@ -230,12 +231,56 @@ class DetectionLossFocal(keras.losses.Loss):
         obj_loss = alpha_factor * modulating_factor * ce * weight_factor
         
         # Bboxes (only where there is an object)
-        box_true = y_true[..., 1:5]   # [B, S, S, 4]
-        box_pred = y_pred[..., 1:5]   # [B, S, S, 4]
-        box_diff = box_true - box_pred
-        box_sq = tf.square(box_diff)
-        box_loss = tf.reduce_sum(box_sq, axis=-1, keepdims=True)  # [B, S, S, 1]
+        box_true = y_true[..., 1:5]   # [B, S, S, 4] - [cx, cy, w, h]
+        box_pred = y_pred[..., 1:5]   # [B, S, S, 4] - [cx, cy, w, h]
+        
+        # Convert to corner format for IoU computation
+        # True boxes
+        cx_true, cy_true, w_true, h_true = tf.split(box_true, 4, axis=-1)
+        xmin_true = cx_true - w_true / 2.0
+        ymin_true = cy_true - h_true / 2.0
+        xmax_true = cx_true + w_true / 2.0
+        ymax_true = cy_true + h_true / 2.0
+        
+        # Predicted boxes
+        cx_pred, cy_pred, w_pred, h_pred = tf.split(box_pred, 4, axis=-1)
+        xmin_pred = cx_pred - w_pred / 2.0
+        ymin_pred = cy_pred - h_pred / 2.0
+        xmax_pred = cx_pred + w_pred / 2.0
+        ymax_pred = cy_pred + h_pred / 2.0
+        
+        # Clip to [0, 1]
+        xmin_true = tf.clip_by_value(xmin_true, 0.0, 1.0)
+        ymin_true = tf.clip_by_value(ymin_true, 0.0, 1.0)
+        xmax_true = tf.clip_by_value(xmax_true, 0.0, 1.0)
+        ymax_true = tf.clip_by_value(ymax_true, 0.0, 1.0)
+        xmin_pred = tf.clip_by_value(xmin_pred, 0.0, 1.0)
+        ymin_pred = tf.clip_by_value(ymin_pred, 0.0, 1.0)
+        xmax_pred = tf.clip_by_value(xmax_pred, 0.0, 1.0)
+        ymax_pred = tf.clip_by_value(ymax_pred, 0.0, 1.0)
+        
+        # Compute IoU
+        inter_xmin = tf.maximum(xmin_true, xmin_pred)
+        inter_ymin = tf.maximum(ymin_true, ymin_pred)
+        inter_xmax = tf.minimum(xmax_true, xmax_pred)
+        inter_ymax = tf.minimum(ymax_true, ymax_pred)
+        
+        inter_w = tf.maximum(0.0, inter_xmax - inter_xmin)
+        inter_h = tf.maximum(0.0, inter_ymax - inter_ymin)
+        inter_area = inter_w * inter_h
+        
+        area_true = (xmax_true - xmin_true) * (ymax_true - ymin_true)
+        area_pred = (xmax_pred - xmin_pred) * (ymax_pred - ymin_pred)
+        union_area = area_true + area_pred - inter_area
+        
+        # IoU with small epsilon to avoid division by zero
+        eps = 1e-7
+        iou = inter_area / (union_area + eps)
+        
+        # Use 1 - IoU as loss (higher IoU = lower loss)
+        box_loss = (1.0 - iou)  # [B, S, S, 1]
         box_loss = box_loss * obj_true  # Mask by objectness
+        box_loss = box_loss * self.bbox_loss_weight  # Apply bbox loss weight
         
         # Classes (only where there is an object)
         cls_true = y_true[..., 5:]   # [B, S, S, C]
@@ -253,6 +298,7 @@ class DetectionLossFocal(keras.losses.Loss):
             "focal_gamma": self.focal_gamma,
             "focal_alpha": self.focal_alpha,
             "positive_weight": self.positive_weight,
+            "bbox_loss_weight": self.bbox_loss_weight,
         }
 
 
@@ -474,8 +520,8 @@ class PredictionStats(keras.callbacks.Callback):
 # ----------------------------
 
 def main():
-    # Load config (reuse your existing coco_multilabel_config.json)
-    config, project_root = load_config("coco_multilabel_config.json")
+    # Load config (reuse your existing config.json)
+    config, project_root = load_config("config.json")
 
     image_size = tuple(config["image_size"])
     batch_size = config["batch_size"]
@@ -490,6 +536,7 @@ def main():
     focal_gamma = config.get("focal_gamma", 2.0)
     focal_alpha = config.get("focal_alpha", 0.5)  # Increased default for imbalanced data
     positive_weight = config.get("positive_weight", 5.0)  # Additional weight for positive examples
+    bbox_loss_weight = config.get("bbox_loss_weight", 10.0)  # Weight for bbox regression loss
     filter_empty_images = config.get("filter_empty_images", False)  # Option to filter empty images
     use_focal_loss = config.get("use_focal_loss", True)  # Use focal loss by default
 
@@ -520,75 +567,26 @@ def main():
             image_size=image_size,
         )
     elif dataset_name == "cct":
-        # Check if TFRecords are available (preferred for speed)
-        use_tfrecords = config.get("cct_use_tfrecords", True)
+        # Load from TFRecords
         cct_tfrecords_dir = config.get("cct_tfrecords_dir")
+        if not cct_tfrecords_dir or not Path(cct_tfrecords_dir).exists():
+            raise ValueError(f"TFRecords directory not found: {cct_tfrecords_dir}. Please generate TFRecords first.")
         
-        if use_tfrecords and cct_tfrecords_dir:
-            from pathlib import Path
-            tfrecords_dir = Path(cct_tfrecords_dir)
-            if tfrecords_dir.exists():
-                print(f"[CCT] Using TFRecords from {tfrecords_dir}")
-                train_ds_raw, train_info = make_cct_tfrecords_dataset(
-                    tfrecords_dir=cct_tfrecords_dir,
-                    split="train",
-                    batch_size=batch_size,
-                    image_size=image_size,
-                    shuffle=True,
-                )
-                val_ds_raw, val_info = make_cct_tfrecords_dataset(
-                    tfrecords_dir=cct_tfrecords_dir,
-                    split="val",
-                    batch_size=batch_size,
-                    image_size=image_size,
-                    shuffle=False,
-                )
-            else:
-                print(f"[CCT] Warning: TFRecords directory not found: {tfrecords_dir}")
-                print(f"[CCT] Falling back to JSON pipeline")
-                use_tfrecords = False
-        else:
-            use_tfrecords = False
-        
-        if not use_tfrecords:
-            # Fall back to JSON pipeline
-            print(f"[CCT] Using JSON pipeline (slower)")
-            from cct_splits_utils import get_filelist_from_splits_or_config
-            
-            train_filelist = get_filelist_from_splits_or_config(config, "train", config["cct_annotations"])
-            val_filelist = get_filelist_from_splits_or_config(config, "val", config["cct_annotations"])
-            
-            train_ds_raw, train_info = make_cct_dataset(
-                images_root=config["cct_images_root"],
-                metadata_path=config["cct_annotations"],
-                bboxes_path=config["cct_bb_annotations"],
-                filelist_path=train_filelist,
-                split="train",
-                batch_size=batch_size,
-                image_size=image_size,
-                filter_empty=filter_empty_images,
-            )
-
-            val_ds_raw, val_info = make_cct_dataset(
-                images_root=config["cct_images_root"],
-                metadata_path=config["cct_annotations"],
-                bboxes_path=config["cct_bb_annotations"],
-                filelist_path=val_filelist,
-                split="val",
-                batch_size=batch_size,
-                image_size=image_size,
-                shuffle=False,
-                filter_empty=filter_empty_images,
-            )
-        
-        # Ensure both datasets use the same num_classes (from train_info)
-        # This is important because both should have the same category mapping
-        if train_info.features["objects"]["label"].num_classes != val_info.features["objects"]["label"].num_classes:
-            raise ValueError(
-                f"Train and val datasets have different num_classes: "
-                f"{train_info.features['objects']['label'].num_classes} vs "
-                f"{val_info.features['objects']['label'].num_classes}"
-            )
+        print(f"[CCT] Using TFRecords from {cct_tfrecords_dir}")
+        train_ds_raw, train_info = make_cct_tfrecords_dataset(
+            tfrecords_dir=cct_tfrecords_dir,
+            split="train",
+            batch_size=batch_size,
+            image_size=image_size,
+            shuffle=True,
+        )
+        val_ds_raw, val_info = make_cct_tfrecords_dataset(
+            tfrecords_dir=cct_tfrecords_dir,
+            split="val",
+            batch_size=batch_size,
+            image_size=image_size,
+            shuffle=False,
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -623,9 +621,10 @@ def main():
         loss_fn = DetectionLossFocal(
             focal_gamma=focal_gamma, 
             focal_alpha=focal_alpha,
-            positive_weight=positive_weight
+            positive_weight=positive_weight,
+            bbox_loss_weight=bbox_loss_weight
         )
-        print(f"[Loss] Using focal loss: gamma={focal_gamma}, alpha={focal_alpha}, positive_weight={positive_weight}")
+        print(f"[Loss] Using focal loss: gamma={focal_gamma}, alpha={focal_alpha}, positive_weight={positive_weight}, bbox_weight={bbox_loss_weight}")
         # Create per-component loss metrics
         component_metrics = make_component_loss_metrics(loss_fn)
         metrics = [objectness_accuracy] + component_metrics

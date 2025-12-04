@@ -12,7 +12,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from .build_yolo_detector import build_ssd_detector_with_metadata
+from .build_detector import build_ssd_detector_with_metadata
 from ..utils.detection_utils import (
     DetectionLossFocal,
     make_component_loss_metrics,
@@ -156,7 +156,8 @@ def main():
     epochs = config["epochs"]
     learning_rate = config["learning_rate"]
     models_dir = project_root / config["models_dir"]
-    model_name = config.get("detector_model_name", "yolo_detector")
+    # Model name is set here, not from config
+    model_name = "TSM"
     
     pretrained_model_type = config.get("pretrained_model_type", "ssd_mobilenet_v2")
     freeze_backbone_epochs = config.get("freeze_backbone_epochs", 5)
@@ -170,7 +171,7 @@ def main():
     models_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
-    print("Training YOLO-style Detector with Metadata")
+    print("Training TSM Detector (Two Stage, with Metadata)")
     print("=" * 60)
     print(f"Model type: {pretrained_model_type}")
     print(f"Image size: {image_size}")
@@ -181,7 +182,7 @@ def main():
     metadata_dim = 5
     
     if dataset_name != "cct":
-        raise ValueError(f"YOLO detector currently only supports CCT dataset, got: {dataset_name}")
+        raise ValueError(f"TSM detector currently only supports CCT dataset, got: {dataset_name}")
     
     # Load datasets from TFRecords
     cct_tfrecords_dir = config.get("cct_tfrecords_dir")

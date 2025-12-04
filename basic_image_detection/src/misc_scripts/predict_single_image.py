@@ -37,7 +37,7 @@ def main():
     # Locate config and model
     # -----------------------------
     project_root = Path(__file__).resolve().parents[2]
-    config_path = project_root / "configs" / "coco_multilabel_config.json"
+    config_path = project_root / "configs" / "config.json"
     config = load_config(str(config_path))
 
     image_size = tuple(config["image_size"])

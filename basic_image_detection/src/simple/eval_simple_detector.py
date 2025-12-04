@@ -14,9 +14,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from ..pipelines.coco_tfds_pipeline import make_coco_dataset
-from ..pipelines.cct_pipeline import make_cct_dataset
 from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from ..pipelines.cct_splits_utils import get_filelist_from_splits_or_config
 from ..utils.detection_utils import compute_map
 
 from .train_simple_detector import (
@@ -211,7 +209,7 @@ def draw_boxes(image, gt_boxes, pred_boxes, class_names):
 
 def load_config():
     project_root = Path(__file__).resolve().parents[2]
-    config_path = project_root / "configs" / "coco_multilabel_config.json"
+    config_path = project_root / "configs" / "config.json"
     with open(config_path, "r") as f:
         return json.load(f), project_root
 
@@ -228,7 +226,7 @@ def main():
     val_split = config["val_split"]
     
     # Adjustable thresholds for evaluation
-    DETECTION_THRESHOLD = 0.5  # Threshold for decoding predictions
+    DETECTION_THRESHOLD = 0.1  # Threshold for decoding predictions (lowered from 0.5 to catch more detections)
     IOU_THRESHOLD_03 = 0.3  # IoU threshold for mAP@0.3
     IOU_THRESHOLD_05 = 0.5  # IoU threshold for mAP@0.5
 
@@ -247,13 +245,15 @@ def main():
     focal_gamma = config.get("focal_gamma", 2.0)
     focal_alpha = config.get("focal_alpha", 0.5)
     positive_weight = config.get("positive_weight", 5.0)
+    bbox_loss_weight = config.get("bbox_loss_weight", 10.0)
     use_focal_loss = config.get("use_focal_loss", True)
     
     # Always create loss function and component metrics (model may have been saved with these)
     loss_fn = DetectionLossFocal(
         focal_gamma=focal_gamma, 
         focal_alpha=focal_alpha,
-        positive_weight=positive_weight
+        positive_weight=positive_weight,
+        bbox_loss_weight=bbox_loss_weight
     )
     custom_objects["DetectionLossFocal"] = DetectionLossFocal
     custom_objects["detection_loss_focal"] = loss_fn
@@ -265,68 +265,51 @@ def main():
 
     model.summary()
 
-    # Build dataset
-    dataset_name = config.get("dataset", "coco")
-
-    if dataset_name == "coco":
-        val_ds_raw, val_info = make_coco_dataset(
-            split=val_split,
-            batch_size=batch_size,
-            image_size=image_size,
-        )
-    elif dataset_name == "cct":
-        # Check if TFRecords are available (preferred for speed)
-        use_tfrecords = config.get("cct_use_tfrecords", True)
-        cct_tfrecords_dir = config.get("cct_tfrecords_dir")
-        
-        if use_tfrecords and cct_tfrecords_dir:
-            from pathlib import Path
-            tfrecords_dir = Path(cct_tfrecords_dir)
-            if tfrecords_dir.exists():
-                print(f"[CCT] Using TFRecords from {tfrecords_dir}")
-                val_ds_raw, val_info = make_cct_tfrecords_dataset(
-                    tfrecords_dir=cct_tfrecords_dir,
-                    split="val",
-                    batch_size=batch_size,
-                    image_size=image_size,
-                    shuffle=False,
-                )
-            else:
-                print(f"[CCT] Warning: TFRecords directory not found: {tfrecords_dir}")
-                print(f"[CCT] Falling back to JSON pipeline")
-                use_tfrecords = False
-        else:
-            use_tfrecords = False
-        
-        if not use_tfrecords:
-            # Fall back to JSON pipeline
-            print(f"[CCT] Using JSON pipeline (slower)")
-            
-            val_filelist = get_filelist_from_splits_or_config(config, "val", config["cct_annotations"])
-            
-            val_ds_raw, val_info = make_cct_dataset(
-                images_root=config["cct_images_root"],
-                metadata_path=config["cct_annotations"],
-                bboxes_path=config["cct_bb_annotations"],
-                filelist_path=val_filelist,
-                split="val",
-                batch_size=batch_size,
-                image_size=image_size,
-                shuffle=False,
-            )
-        
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
+    # Load dataset
+    dataset_name = config.get("dataset", "cct")
+    metadata_dim = 5
+    
+    if dataset_name != "cct":
+        raise ValueError(f"YOLO detector currently only supports CCT dataset")
+    
+    # Load validation dataset from TFRecords
+    cct_tfrecords_dir = config.get("cct_tfrecords_dir")
+    if not cct_tfrecords_dir or not Path(cct_tfrecords_dir).exists():
+        raise ValueError(f"TFRecords directory not found: {cct_tfrecords_dir}. Please generate TFRecords first.")
+    
+    print(f"[Dataset] Using TFRecords from {cct_tfrecords_dir}")
+    val_ds_raw, val_info = make_cct_tfrecords_dataset(
+        tfrecords_dir=cct_tfrecords_dir,
+        split="val",
+        batch_size=batch_size,
+        image_size=image_size,
+        shuffle=False,
+    )
+    
     num_classes = val_info.features["objects"]["label"].num_classes
     class_names = val_info.features["objects"]["label"].names
+    
+    # Add placeholder metadata for TFRecords
+    def add_placeholder_metadata(images, targets):
+        batch_size = tf.shape(images)[0]
+        brightness = tf.reduce_mean(images, axis=[1, 2, 3])
+        location_id = tf.zeros([batch_size], dtype=tf.float32)
+        hour = tf.ones([batch_size], dtype=tf.float32) * 0.5
+        day_of_week = tf.ones([batch_size], dtype=tf.float32) * 0.5
+        month = tf.ones([batch_size], dtype=tf.float32) * 0.5
+        metadata = tf.stack([location_id, hour, day_of_week, month, brightness], axis=1)
+        return (images, metadata), targets
+    
+    val_ds_with_meta = val_ds_raw.map(add_placeholder_metadata, num_parallel_calls=tf.data.AUTOTUNE)
+
+    num_classes = val_info.features["objects"]["label"].num_classes
     grid_size = infer_grid_size(image_size)
 
     # We need the encoder from train script
     encoder = make_grid_encoder(num_classes, grid_size)
 
     AUTOTUNE = tf.data.AUTOTUNE
-    val_ds = val_ds_raw.map(encoder).prefetch(AUTOTUNE)
+    val_ds = val_ds_with_meta.map(encoder).prefetch(AUTOTUNE)
 
     # ----------------------------------------------------------
     # 1) Numeric evaluation (objectness accuracy)
@@ -348,6 +331,7 @@ def main():
     predictions_list = []
     ground_truth_list = []
     images_list = []  # Store images for visualization
+    pred_grids_all = []  # Store all prediction grids for diagnostics
     
     for batch_idx, batch in enumerate(val_ds):
         if isinstance(batch, tuple) and len(batch) == 2:
@@ -355,13 +339,43 @@ def main():
         else:
             continue
         
+        # Ensure images are in correct format for model preprocessing
+        # Model expects [0, 255] range for mobilenet_v2.preprocess_input
+        # Dataset provides [0, 1] range, so convert if needed
+        if images.dtype == tf.float32 and tf.reduce_max(images) <= 1.0:
+            # Convert from [0, 1] to [0, 255] for preprocessing
+            images_for_model = images * 255.0
+        else:
+            images_for_model = images
+        
         # Get predictions
-        pred_grids = model(images, training=False)
+        pred_grids = model(images_for_model, training=False)
         
         # Convert to numpy
         pred_grids_np = pred_grids.numpy()
         images_np = images.numpy()
         grid_true_np = grid_true.numpy()
+        
+        # Store for diagnostics
+        pred_grids_all.append(pred_grids_np)
+        
+        # Detailed diagnostics for first batch
+        if batch_idx == 0:
+            print(f"\n[Debug] First batch predictions:")
+            print(f"  Prediction shape: {pred_grids_np.shape}")
+            print(f"  Prediction dtype: {pred_grids_np.dtype}")
+            print(f"  Objectness channel stats:")
+            obj_channel = pred_grids_np[..., 0]  # Objectness is first channel
+            print(f"    Min: {np.min(obj_channel):.6f}, Max: {np.max(obj_channel):.6f}")
+            print(f"    Mean: {np.mean(obj_channel):.6f}, Std: {np.std(obj_channel):.6f}")
+            print(f"    Non-zero count: {np.count_nonzero(obj_channel)} / {obj_channel.size}")
+            print(f"  Image stats:")
+            print(f"    Min: {np.min(images_np):.6f}, Max: {np.max(images_np):.6f}")
+            print(f"    Mean: {np.mean(images_np):.6f}, Std: {np.std(images_np):.6f}")
+            print(f"  Ground truth objectness stats:")
+            gt_obj_channel = grid_true_np[..., 0]
+            print(f"    Min: {np.min(gt_obj_channel):.6f}, Max: {np.max(gt_obj_channel):.6f}")
+            print(f"    Mean: {np.mean(gt_obj_channel):.6f}, Non-zero count: {np.count_nonzero(gt_obj_channel)}")
         
         # Decode predictions for each image in batch
         batch_size_actual = pred_grids_np.shape[0]
@@ -422,6 +436,36 @@ def main():
         if batch_idx >= 10:
             break
     
+    # Diagnostic output before computing mAP
+    total_gt_boxes = sum(len(gt) for gt in ground_truth_list)
+    total_pred_boxes = sum(len(pred) for pred in predictions_list)
+    images_with_gt = sum(1 for gt in ground_truth_list if len(gt) > 0)
+    images_with_pred = sum(1 for pred in predictions_list if len(pred) > 0)
+    
+    print(f"\nDiagnostics:")
+    print(f"  Total images evaluated: {len(predictions_list)}")
+    print(f"  Images with GT boxes: {images_with_gt} ({100*images_with_gt/len(predictions_list):.1f}%)")
+    print(f"  Images with predictions: {images_with_pred} ({100*images_with_pred/len(predictions_list):.1f}%)")
+    print(f"  Total GT boxes: {total_gt_boxes}")
+    print(f"  Total predicted boxes: {total_pred_boxes}")
+    print(f"  Avg GT boxes per image: {total_gt_boxes/len(predictions_list):.2f}")
+    print(f"  Avg pred boxes per image: {total_pred_boxes/len(predictions_list):.2f}")
+    
+    # Check objectness scores
+    if len(pred_grids_all) > 0:
+        max_obj_scores = []
+        for batch_grids in pred_grids_all[:2]:  # Check first 2 batches
+            for img_idx in range(batch_grids.shape[0]):
+                max_obj = np.max(batch_grids[img_idx, ..., 0])
+                max_obj_scores.append(max_obj)
+                if len(max_obj_scores) >= 10:
+                    break
+            if len(max_obj_scores) >= 10:
+                break
+        if max_obj_scores:
+            print(f"  Max objectness scores (first {len(max_obj_scores)} images): {[f'{s:.3f}' for s in max_obj_scores]}")
+            print(f"  Avg max objectness: {np.mean(max_obj_scores):.3f}")
+    
     # Compute mAP
     print(f"\nEvaluated {len(predictions_list)} images")
     map_3 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=IOU_THRESHOLD_03)
@@ -439,6 +483,8 @@ def main():
         print(f"  Pred boxes: {len(predictions_list[i])}")
         if predictions_list[i]:
             print(f"  Top prediction: class={predictions_list[i][0]['class_id']}, score={predictions_list[i][0]['score']:.3f}")
+        if ground_truth_list[i]:
+            print(f"  GT classes: {[gt['class_id'] for gt in ground_truth_list[i]]}")
     
     # ----------------------------------------------------------
     # 3) Visualization
