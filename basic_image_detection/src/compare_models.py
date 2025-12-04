@@ -23,7 +23,6 @@ from .utils.detection_utils import (
     DetectionLossFocal,
     make_component_loss_metrics,
     objectness_accuracy,
-    compute_map,
     decode_predictions_grid,
     compute_iou,
 )
@@ -110,6 +109,96 @@ def make_grid_encoder(num_classes, image_size, grid_size):
     return _tf_fn
 
 
+def compute_mean_precision(predictions_list, ground_truth_list, num_classes):
+    """
+    Compute mean precision across all classes. This metric penalizes incorrect class predictions.
+    
+    Precision = TP / (TP + FP) for each class, where:
+    - TP (True Positive): Prediction with correct class_id that matches a GT box of that class
+    - FP (False Positive): Prediction with incorrect class_id (doesn't match any GT box of that class)
+    
+    Returns the average precision across all classes.
+    
+    Args:
+        predictions_list: List of lists, each containing prediction dicts for one image
+        ground_truth_list: List of lists, each containing GT dicts for one image
+        num_classes: Number of classes
+    
+    Returns:
+        Mean precision (float): average precision across all classes (0-1)
+    """
+    # Per-class counts: [TP, FP] for each class
+    class_stats = {class_id: {"tp": 0, "fp": 0} for class_id in range(num_classes)}
+    
+    for preds, gts in zip(predictions_list, ground_truth_list):
+        # Get GT class IDs for this image
+        gt_class_ids = set(gt.get("class_id") for gt in gts)
+        
+        # For each prediction, check if it's a TP or FP
+        for pred in preds:
+            pred_class_id = pred.get("class_id")
+            if pred_class_id < 0 or pred_class_id >= num_classes:
+                continue
+            
+            # Check if this class appears in GT for this image
+            if pred_class_id in gt_class_ids:
+                # True positive: prediction matches a GT class in this image
+                class_stats[pred_class_id]["tp"] += 1
+            else:
+                # False positive: prediction doesn't match any GT class in this image
+                class_stats[pred_class_id]["fp"] += 1
+    
+    # Compute precision for each class
+    precisions = []
+    for class_id in range(num_classes):
+        tp = class_stats[class_id]["tp"]
+        fp = class_stats[class_id]["fp"]
+        
+        if tp + fp == 0:
+            # No predictions for this class, skip it
+            continue
+        
+        precision = tp / (tp + fp)
+        precisions.append(precision)
+    
+    # Return mean precision across classes that had predictions
+    if len(precisions) == 0:
+        return 0.0
+    
+    return sum(precisions) / len(precisions)
+
+
+def compute_empty_accuracy(predictions_list, ground_truth_list):
+    """
+    Compute accuracy of detecting empty images (images with no objects).
+    
+    Args:
+        predictions_list: List of lists, each containing prediction dicts for one image
+        ground_truth_list: List of lists, each containing GT dicts for one image
+    
+    Returns:
+        Empty accuracy (float): fraction of empty images that are correctly identified as empty
+    """
+    total_empty_images = 0
+    correctly_identified_empty = 0
+    
+    for preds, gts in zip(predictions_list, ground_truth_list):
+        # GT is empty if there are no GT boxes
+        gt_is_empty = len(gts) == 0
+        
+        if gt_is_empty:
+            total_empty_images += 1
+            # Prediction is correct if it also predicts no objects
+            pred_is_empty = len(preds) == 0
+            if pred_is_empty:
+                correctly_identified_empty += 1
+    
+    if total_empty_images == 0:
+        return 1.0  # No empty images in dataset, return perfect score
+    
+    return correctly_identified_empty / total_empty_images
+
+
 def load_model(model_name, model_path, config):
     """Load a saved model with appropriate custom objects."""
     focal_gamma = config.get("focal_gamma", 2.0)
@@ -153,6 +242,7 @@ def evaluate_model(model, model_name, val_ds, num_classes, class_names, grid_siz
     ground_truth_list = []
     
     batch_count = 0
+    total_gt_found = 0
     for batch in val_ds:
         if batch_count >= max_batches:
             break
@@ -209,40 +299,14 @@ def evaluate_model(model, model_name, val_ds, num_classes, class_names, grid_siz
             )
             predictions_list.append(pred_boxes)
             
-            # Get ground truth from grid targets
+            # Get ground truth from raw dataset format (dict with bboxes and labels)
             gt_boxes = []
-            if isinstance(targets, np.ndarray):
-                # Grid format
-                grid_t = targets[i]
-                S = grid_t.shape[0]
-                for gy in range(S):
-                    for gx in range(S):
-                        cell = grid_t[gy, gx]
-                        if cell[0] < 0.5:
-                            continue
-                        cx, cy, w, h = cell[1:5]
-                        xmin = cx - w/2
-                        ymin = cy - h/2
-                        xmax = cx + w/2
-                        ymax = cy + h/2
-                        
-                        xmin = np.clip(xmin, 0, 1)
-                        ymin = np.clip(ymin, 0, 1)
-                        xmax = np.clip(xmax, 0, 1)
-                        ymax = np.clip(ymax, 0, 1)
-                        
-                        class_probs = cell[5:]
-                        class_id = int(np.argmax(class_probs))
-                        
-                        gt_boxes.append({
-                            "bbox": [ymin, xmin, ymax, xmax],
-                            "class_id": class_id,
-                        })
-            elif isinstance(targets, dict):
-                # Dict format
+            if isinstance(targets, dict):
+                # Extract bboxes and labels for this image
                 bboxes_batch = targets["bboxes"]
                 labels_batch = targets["labels"]
                 
+                # Convert to numpy if needed
                 if hasattr(bboxes_batch, "numpy"):
                     bboxes = bboxes_batch.numpy()[i]
                     labels = labels_batch.numpy()[i]
@@ -250,44 +314,71 @@ def evaluate_model(model, model_name, val_ds, num_classes, class_names, grid_siz
                     bboxes = bboxes_batch[i]
                     labels = labels_batch[i]
                 
+                # Filter out padded boxes (zero boxes)
                 for bbox, label in zip(bboxes, labels):
+                    # Check if bbox is valid (not all zeros)
+                    # Also check if box has valid dimensions
                     ymin, xmin, ymax, xmax = bbox
-                    if (np.sum(np.abs(bbox)) > 1e-6 and
-                        ymax > ymin and xmax > xmin and
-                        ymin >= 0 and xmin >= 0 and ymax <= 1 and xmax <= 1):
+                    if (np.sum(np.abs(bbox)) > 1e-6 and  # Not all zeros
+                        ymax > ymin and xmax > xmin and  # Valid dimensions
+                        ymin >= 0 and xmin >= 0 and ymax <= 1 and xmax <= 1):  # Within bounds
                         gt_boxes.append({
                             "bbox": [float(ymin), float(xmin), float(ymax), float(xmax)],
                             "class_id": int(label),
                         })
+            else:
+                # If targets are not in dict format, try to extract from tensor/array
+                # This shouldn't happen with raw dataset, but handle it just in case
+                print(f"  [Warning] Unexpected targets format: {type(targets)}")
             
             ground_truth_list.append(gt_boxes)
+            total_gt_found += len(gt_boxes)
         
         batch_count += 1
+        
+        # Debug output for first batch
+        if batch_count == 1:
+            print(f"  [Debug] First batch:")
+            print(f"    Targets type: {type(targets)}")
+            if isinstance(targets, dict):
+                print(f"    Targets keys: {targets.keys()}")
+                if "bboxes" in targets:
+                    bboxes_shape = targets["bboxes"].shape if hasattr(targets["bboxes"], "shape") else "unknown"
+                    print(f"    Bboxes shape: {bboxes_shape}")
+                    if hasattr(targets["bboxes"], "numpy"):
+                        bboxes_np = targets["bboxes"].numpy()
+                        print(f"    Bboxes numpy shape: {bboxes_np.shape}")
+                        print(f"    Non-zero bboxes in first image: {np.sum(np.any(bboxes_np[0] != 0, axis=1))}")
+                if "labels" in targets:
+                    labels_shape = targets["labels"].shape if hasattr(targets["labels"], "shape") else "unknown"
+                    print(f"    Labels shape: {labels_shape}")
+            print(f"    GT boxes found in first batch: {sum(len(gt) for gt in ground_truth_list)}")
     
     # Compute metrics
-    map_3 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.3)
-    map_5 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.5)
-    map_8 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.8)
+    mean_precision = compute_mean_precision(predictions_list, ground_truth_list, num_classes)
+    empty_accuracy = compute_empty_accuracy(predictions_list, ground_truth_list)
     
     total_gt = sum(len(gt) for gt in ground_truth_list)
     total_pred = sum(len(pred) for pred in predictions_list)
     
     results = {
         "model": model_name,
-        "mAP@0.3": map_3,
-        "mAP@0.5": map_5,
-        "mAP@0.8": map_8,
+        "mean_precision": mean_precision,
+        "empty_accuracy": empty_accuracy,
         "total_gt_boxes": total_gt,
         "total_pred_boxes": total_pred,
         "avg_pred_per_image": total_pred / len(predictions_list) if predictions_list else 0,
         "avg_gt_per_image": total_gt / len(ground_truth_list) if ground_truth_list else 0,
     }
     
-    print(f"  mAP@0.3: {map_3:.4f}")
-    print(f"  mAP@0.5: {map_5:.4f}")
-    print(f"  mAP@0.8: {map_8:.4f}")
+    print(f"  Mean Precision: {mean_precision:.4f}")
+    print(f"  Empty Accuracy: {empty_accuracy:.4f}")
     print(f"  Total GT boxes: {total_gt}")
     print(f"  Total pred boxes: {total_pred}")
+    print(f"  Images evaluated: {len(predictions_list)}")
+    
+    if total_gt == 0:
+        print(f"  ⚠ WARNING: No ground truth boxes found! Check dataset encoding.")
     
     return results
 
@@ -326,23 +417,13 @@ def main():
     print(f"Number of classes: {num_classes}")
     
     # Prepare datasets for each model type
-    # Need to get grid size first by building a test model
-    pretrained_model_type = config.get("pretrained_model_type", "ssd_mobilenet_v2")
+    # Use raw dataset format (not encoded) for proper GT extraction
+    # Models will handle their own preprocessing
     
-    # Build a test model to get grid size
-    test_model = build_ssnm(image_size, num_classes)
-    test_output = test_model(tf.zeros((1, image_size[0], image_size[1], 3)), training=False)
-    grid_h, grid_w = test_output.shape[1], test_output.shape[2]
-    grid_size = (grid_h, grid_w)
-    print(f"Grid size: {grid_h}x{grid_w}")
+    # For models without metadata: use raw dataset
+    val_ds_no_meta = val_ds_raw.prefetch(tf.data.AUTOTUNE)
     
-    # Create encoder
-    encoder = make_grid_encoder(num_classes, image_size, grid_size)
-    
-    # For models without metadata: encode to grid
-    val_ds_no_meta = val_ds_raw.map(encoder, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    
-    # For models with metadata: add metadata then encode
+    # For models with metadata: add metadata but keep raw targets
     def add_placeholder_metadata(images, targets):
         batch_size = tf.shape(images)[0]
         brightness = tf.reduce_mean(images, axis=[1, 2, 3])
@@ -353,13 +434,15 @@ def main():
         metadata = tf.stack([location_id, hour, day_of_week, month, brightness], axis=1)
         return (images, metadata), targets
     
-    def encode_with_metadata(inputs, targets):
-        images, metadata = inputs
-        images_encoded, grid_targets = encoder(images, targets)
-        return (images_encoded, metadata), grid_targets
+    val_ds_with_meta = val_ds_raw.map(add_placeholder_metadata, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
     
-    val_ds_with_meta = val_ds_raw.map(add_placeholder_metadata, num_parallel_calls=tf.data.AUTOTUNE)
-    val_ds_with_meta = val_ds_with_meta.map(encode_with_metadata, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    # Get grid size for decoding predictions (need to know output shape)
+    pretrained_model_type = config.get("pretrained_model_type", "ssd_mobilenet_v2")
+    test_model = build_ssnm(image_size, num_classes)
+    test_output = test_model(tf.zeros((1, image_size[0], image_size[1], 3)), training=False)
+    grid_h, grid_w = test_output.shape[1], test_output.shape[2]
+    grid_size = (grid_h, grid_w)
+    print(f"Grid size: {grid_h}x{grid_w}")
     
     # Models to evaluate
     models_to_eval = [
@@ -400,9 +483,8 @@ def main():
             print("\n" + "=" * 80)
             print("BEST MODELS BY METRIC")
             print("=" * 80)
-            print(f"  Best mAP@0.3: {df.loc[df['mAP@0.3'].idxmax(), 'model']} ({df['mAP@0.3'].max():.4f})")
-            print(f"  Best mAP@0.5: {df.loc[df['mAP@0.5'].idxmax(), 'model']} ({df['mAP@0.5'].max():.4f})")
-            print(f"  Best mAP@0.8: {df.loc[df['mAP@0.8'].idxmax(), 'model']} ({df['mAP@0.8'].max():.4f})")
+            print(f"  Best Mean Precision: {df.loc[df['mean_precision'].idxmax(), 'model']} ({df['mean_precision'].max():.4f})")
+            print(f"  Best Empty Accuracy: {df.loc[df['empty_accuracy'].idxmax(), 'model']} ({df['empty_accuracy'].max():.4f})")
             
             # Save results
             results_path = project_root / "model_comparison_results.csv"
@@ -412,21 +494,19 @@ def main():
             # Print without pandas
             print("\nModel Comparison Results:")
             print("-" * 80)
-            print(f"{'Model':<8} {'mAP@0.3':<10} {'mAP@0.5':<10} {'mAP@0.8':<10} {'GT Boxes':<10} {'Pred Boxes':<12}")
+            print(f"{'Model':<8} {'Mean Prec':<12} {'Empty Acc':<12} {'GT Boxes':<10} {'Pred Boxes':<12}")
             print("-" * 80)
             for r in all_results:
-                print(f"{r['model']:<8} {r['mAP@0.3']:<10.4f} {r['mAP@0.5']:<10.4f} {r['mAP@0.8']:<10.4f} {r['total_gt_boxes']:<10} {r['total_pred_boxes']:<12}")
+                print(f"{r['model']:<8} {r['mean_precision']:<12.4f} {r['empty_accuracy']:<12.4f} {r['total_gt_boxes']:<10} {r['total_pred_boxes']:<12}")
             
             # Find best models
             print("\n" + "=" * 80)
             print("BEST MODELS BY METRIC")
             print("=" * 80)
-            best_map3 = max(all_results, key=lambda x: x['mAP@0.3'])
-            best_map5 = max(all_results, key=lambda x: x['mAP@0.5'])
-            best_map8 = max(all_results, key=lambda x: x['mAP@0.8'])
-            print(f"  Best mAP@0.3: {best_map3['model']} ({best_map3['mAP@0.3']:.4f})")
-            print(f"  Best mAP@0.5: {best_map5['model']} ({best_map5['mAP@0.5']:.4f})")
-            print(f"  Best mAP@0.8: {best_map8['model']} ({best_map8['mAP@0.8']:.4f})")
+            best_precision = max(all_results, key=lambda x: x['mean_precision'])
+            best_empty = max(all_results, key=lambda x: x['empty_accuracy'])
+            print(f"  Best Mean Precision: {best_precision['model']} ({best_precision['mean_precision']:.4f})")
+            print(f"  Best Empty Accuracy: {best_empty['model']} ({best_empty['empty_accuracy']:.4f})")
             
             # Save as JSON
             results_path = project_root / "model_comparison_results.json"
