@@ -16,6 +16,7 @@ from ..utils.detection_utils import (
     make_component_loss_metrics,
     objectness_accuracy,
 )
+from ..utils.anchor_encoder import make_anchor_encoder
 
 
 def load_config(config_name="config.json"):
@@ -26,81 +27,12 @@ def load_config(config_name="config.json"):
     return config, project_root
 
 
-def make_grid_encoder_for_detector(num_classes, image_size, grid_size=None):
-    """Create encoder that converts CCT format to grid format."""
+def infer_grid_size(image_size):
+    """Infer grid size from CSPDarkNet backbone stride (32x downsampling)."""
     h, w = image_size
-    
-    if grid_size is not None:
-        if isinstance(grid_size, (tuple, list)):
-            grid_h, grid_w = grid_size
-        else:
-            grid_h = grid_w = grid_size
-    else:
-        if h == 224 and w == 224:
-            grid_h = grid_w = 7
-        elif h == 320 and w == 320:
-            grid_h = grid_w = 10
-        else:
-            grid_h = grid_w = max(7, int(h / 32))
-    
-    depth = 1 + 4 + num_classes
-    
-    def _tf_fn(images, targets):
-        def _np_encode(images_np, bboxes_np, labels_np):
-            B = images_np.shape[0]
-            grid = np.zeros((B, grid_h, grid_w, depth), dtype=np.float32)
-            
-            for b in range(B):
-                boxes = bboxes_np[b]
-                classes = labels_np[b]
-                
-                for box, cls in zip(boxes, classes):
-                    ymin, xmin, ymax, xmax = box
-                    
-                    if ymax <= ymin or xmax <= xmin:
-                        continue
-                    
-                    cx = (xmin + xmax) / 2.0
-                    cy = (ymin + ymax) / 2.0
-                    w = xmax - xmin
-                    h = ymax - ymin
-                    
-                    if w <= 0.0 or h <= 0.0:
-                        continue
-                    
-                    gx = int(cx * grid_w)
-                    gy = int(cy * grid_h)
-                    
-                    if gx < 0 or gx >= grid_w or gy < 0 or gy >= grid_h:
-                        continue
-                    
-                    cls_int = int(cls)
-                    if cls_int < 0 or cls_int >= num_classes:
-                        continue
-                    
-                    existing_obj = grid[b, gy, gx, 0]
-                    if existing_obj == 1.0:
-                        existing_w = grid[b, gy, gx, 3]
-                        existing_h = grid[b, gy, gx, 4]
-                        if w * h <= existing_w * existing_h:
-                            continue
-                    
-                    grid[b, gy, gx, 0] = 1.0
-                    grid[b, gy, gx, 1:5] = [cx, cy, w, h]
-                    grid[b, gy, gx, 5 + cls_int] = 1.0
-            
-            return grid
-        
-        labels = tf.cast(targets["labels"], tf.int32)
-        grid = tf.numpy_function(
-            _np_encode,
-            [images, targets["bboxes"], labels],
-            tf.float32,
-        )
-        grid.set_shape((None, grid_h, grid_w, depth))
-        return images, grid
-    
-    return _tf_fn
+    grid_h = h // 32
+    grid_w = w // 32
+    return grid_h, grid_w
 
 
 def main():
@@ -122,6 +54,7 @@ def main():
     focal_alpha = config.get("focal_alpha", 0.5)
     positive_weight = config.get("positive_weight", 4.0)
     bbox_loss_weight = config.get("bbox_loss_weight", 10.0)
+    objectness_label_smoothing = config.get("objectness_label_smoothing", 0.1)
     
     models_dir.mkdir(parents=True, exist_ok=True)
     
@@ -142,24 +75,94 @@ def main():
     if not cct_tfrecords_dir or not Path(cct_tfrecords_dir).exists():
         raise ValueError(f"TFRecords directory not found: {cct_tfrecords_dir}.")
     
+    # Get split names from config (default to "train" and "val" if not specified)
+    train_split = config.get("train_split", "train")
+    val_split = config.get("val_split", "val")
+    
+    # Extract base split name (remove percentage syntax like "[:1%]")
+    train_split_base = train_split.split("[")[0].strip() if "[" in train_split else train_split
+    val_split_base = val_split.split("[")[0].strip() if "[" in val_split else val_split
+    
+    # Map common split name variations to TFRecord naming convention
+    # TFRecord files use "train" and "val", not "training" or "validation"
+    split_name_map = {
+        "train": "train",
+        "training": "train",
+        "val": "val",
+        "validation": "val",
+        "valid": "val",
+        "test": "test",
+        "testing": "test",
+    }
+    train_split_base = split_name_map.get(train_split_base.lower(), train_split_base)
+    val_split_base = split_name_map.get(val_split_base.lower(), val_split_base)
+    
     print(f"[Dataset] Using TFRecords from {cct_tfrecords_dir}")
+    print(f"[Dataset] Train split: {train_split_base}, Val split: {val_split_base}")
     train_ds_raw, train_info = make_cct_tfrecords_dataset(
         tfrecords_dir=cct_tfrecords_dir,
-        split="train",
+        split=train_split_base,
         batch_size=batch_size,
         image_size=image_size,
         shuffle=True,
     )
     val_ds_raw, val_info = make_cct_tfrecords_dataset(
         tfrecords_dir=cct_tfrecords_dir,
-        split="val",
+        split=val_split_base,
         batch_size=batch_size,
         image_size=image_size,
         shuffle=False,
     )
     
+    # Apply percentage filtering if specified in config
+    if "[" in train_split and "%" in train_split:
+        import re
+        match = re.search(r'\[:(\d+)%\]', train_split)
+        if match:
+            percentage = int(match.group(1))
+            try:
+                total_size = train_info.num_samples if hasattr(train_info, 'num_samples') else None
+                if total_size is None:
+                    cardinality = train_ds_raw.cardinality().numpy()
+                    total_size = cardinality if cardinality >= 0 else None
+            except:
+                total_size = None
+            
+            if total_size and total_size > 0:
+                take_size = max(1, int(total_size * percentage / 100))
+                print(f"[Dataset] Limiting train split to {percentage}% ({take_size} of {total_size} samples)")
+                train_ds_raw = train_ds_raw.take(take_size)
+            else:
+                print(f"[Dataset] Warning: Could not determine dataset size for percentage filtering")
+    
+    if "[" in val_split and "%" in val_split:
+        import re
+        match = re.search(r'\[:(\d+)%\]', val_split)
+        if match:
+            percentage = int(match.group(1))
+            try:
+                total_size = val_info.num_samples if hasattr(val_info, 'num_samples') else None
+                if total_size is None:
+                    cardinality = val_ds_raw.cardinality().numpy()
+                    total_size = cardinality if cardinality >= 0 else None
+            except:
+                total_size = None
+            
+            if total_size and total_size > 0:
+                take_size = max(1, int(total_size * percentage / 100))
+                print(f"[Dataset] Limiting val split to {percentage}% ({take_size} of {total_size} samples)")
+                val_ds_raw = val_ds_raw.take(take_size)
+            else:
+                print(f"[Dataset] Warning: Could not determine dataset size for percentage filtering")
+    
     num_classes = train_info.features["objects"]["label"].num_classes
     print(f"Number of classes: {num_classes}")
+    
+    # Get grid size and anchor configuration
+    grid_h, grid_w = infer_grid_size(image_size)
+    grid_size = (grid_h, grid_w)
+    num_anchors = config.get("num_anchors", 3)
+    print(f"Grid size: {grid_h}x{grid_w}, num_anchors: {num_anchors}")
     
     # Build model (no metadata)
     print("\n[Model] Building detector...")
@@ -168,19 +171,20 @@ def main():
         num_classes=num_classes,
         backbone_type=pretrained_model_type,
         freeze_backbone=True,  # Start frozen
+        num_anchors=num_anchors,
     )
     
     # Get output shape
     test_image = tf.zeros((1, image_size[0], image_size[1], 3))
     test_output = model(test_image, training=False)
     output_shape = test_output.shape
-    grid_h, grid_w = output_shape[1], output_shape[2]
-    print(f"[Model] Detected output grid size: {grid_h}x{grid_w}")
+    print(f"[Model] Output shape: {output_shape}")
+    print(f"[Model] Grid size: {grid_h}x{grid_w}")
     
     model.summary()
     
-    # Create encoder
-    encoder = make_grid_encoder_for_detector(num_classes, image_size, grid_size=(grid_h, grid_w))
+    # Create anchor encoder
+    encoder = make_anchor_encoder(num_classes, grid_size, num_anchors=num_anchors)
     
     train_ds = train_ds_raw.map(encoder, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
     val_ds = val_ds_raw.map(encoder, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
@@ -190,7 +194,10 @@ def main():
         focal_gamma=focal_gamma,
         focal_alpha=focal_alpha,
         positive_weight=positive_weight,
-        bbox_loss_weight=bbox_loss_weight
+        bbox_loss_weight=bbox_loss_weight,
+        num_anchors=num_anchors,
+        use_anchors=True,
+        objectness_label_smoothing=objectness_label_smoothing,
     )
     component_metrics = make_component_loss_metrics(loss_fn)
     
@@ -203,13 +210,34 @@ def main():
     best_model_path = models_dir / f"{model_name}_best.keras"
     last_model_path = models_dir / f"{model_name}_last.keras"
     
+    # Custom ModelCheckpoint that handles JSON serialization errors
+    class SafeModelCheckpoint(keras.callbacks.ModelCheckpoint):
+        """ModelCheckpoint that handles JSON serialization errors gracefully."""
+        def on_epoch_end(self, epoch, logs=None):
+            try:
+                super().on_epoch_end(epoch, logs)
+            except (TypeError, ValueError) as e:
+                if "serialize" in str(e).lower() or "json" in str(e).lower() or "EagerTensor" in str(e):
+                    # Fallback: save weights only
+                    print(f"\n[Warning] Could not save full model due to serialization error: {e}")
+                    print(f"[Warning] Saving weights only instead...")
+                    weights_path = str(self.filepath).replace('.keras', '_weights.h5')
+                    try:
+                        self.model.save_weights(weights_path)
+                        print(f"[Warning] Saved weights to {weights_path}")
+                    except Exception as e2:
+                        print(f"[Error] Could not save weights either: {e2}")
+                else:
+                    raise
+    
     callbacks_stage1 = [
-        keras.callbacks.ModelCheckpoint(
+        SafeModelCheckpoint(
             filepath=str(best_model_path),
             monitor="val_loss",
             mode="min",
             save_best_only=True,
             verbose=1,
+            save_format="keras",  # Explicitly use Keras format
         ),
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
@@ -228,12 +256,13 @@ def main():
     ]
     
     callbacks_stage2 = [
-        keras.callbacks.ModelCheckpoint(
+        SafeModelCheckpoint(
             filepath=str(best_model_path),
             monitor="val_loss",
             mode="min",
             save_best_only=True,
             verbose=1,
+            save_format="keras",  # Explicitly use Keras format
         ),
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
@@ -275,6 +304,7 @@ def main():
         for layer in model.layers:
             layer_name_lower = layer.name.lower()
             if ("backbone" in layer.name or 
+                "cspdarknet" in layer_name_lower or
                 "mobilenet" in layer_name_lower or 
                 "resnet" in layer_name_lower or
                 "efficientnet" in layer_name_lower):
@@ -306,8 +336,15 @@ def main():
             verbose=1,
         )
     
-    model.save(str(last_model_path))
-    print(f"\nSaved model to {last_model_path}")
+    # Save model explicitly with Keras format to avoid serialization issues
+    try:
+        model.save(str(last_model_path), save_format="keras")
+        print(f"\nSaved model to {last_model_path}")
+    except Exception as e:
+        print(f"\nWarning: Could not save model in Keras format: {e}")
+        # Fallback: try saving weights only
+        model.save_weights(str(last_model_path).replace('.keras', '_weights.h5'))
+        print(f"Saved model weights instead")
     print(f"Best model (by val_loss) at {best_model_path}")
 
 

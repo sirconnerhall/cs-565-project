@@ -4,6 +4,13 @@ Train all four detector models successively:
 - SSM: Single Stage, with Metadata
 - TSNM: Two Stage, No Metadata
 - TSM: Two Stage, with Metadata
+
+All models use:
+- Anchor-based detection (configurable via num_anchors in config.json)
+- EfficientNet-B0 or CSPDarkNet backbone (configurable via pretrained_model_type)
+- Focal loss for object detection
+
+Configuration is read from configs/config.json.
 """
 
 import sys
@@ -72,6 +79,10 @@ def main():
     print("  2. SSM  - Single Stage, with Metadata")
     print("  3. TSNM - Two Stage, No Metadata")
     print("  4. TSM  - Two Stage, with Metadata")
+    print("\nArchitecture:")
+    print("  - Anchor-based detection (YOLO-style)")
+    print("  - Backbone: EfficientNet-B0 (or CSPDarkNet)")
+    print("  - All configuration from configs/config.json")
     print("\nNote: This may take a long time depending on your configuration.")
     
     start_time = time.time()

@@ -37,6 +37,8 @@ def parse_tf_example(example_proto, image_size=None):
         'bboxes': tf.io.VarLenFeature(tf.float32),
         'labels': tf.io.VarLenFeature(tf.int64),
         'file_name': tf.io.FixedLenFeature([], tf.string),
+        'location': tf.io.FixedLenFeature([], tf.string, default_value=b''),
+        'date_captured': tf.io.FixedLenFeature([], tf.string, default_value=b''),
     }
     
     parsed = tf.io.parse_single_example(example_proto, feature_description)
@@ -73,9 +75,15 @@ def parse_tf_example(example_proto, image_size=None):
         lambda: tf.zeros((0,), dtype=tf.int32)
     )
     
+    # Parse metadata
+    location_str = parsed['location']
+    date_captured_str = parsed['date_captured']
+    
     targets = {
         "bboxes": bboxes,
         "labels": labels,
+        "location": location_str,
+        "date_captured": date_captured_str,
     }
     
     return image, targets
@@ -192,6 +200,8 @@ def make_cct_tfrecords_dataset(
             {
                 "bboxes": [None, 4],  # variable number of boxes
                 "labels": [None],
+                "location": [],  # string scalar (will be batched to [B])
+                "date_captured": [],  # string scalar (will be batched to [B])
             },
         ),
         padding_values=(
@@ -199,6 +209,8 @@ def make_cct_tfrecords_dataset(
             {
                 "bboxes": tf.constant(0.0, dtype=tf.float32),
                 "labels": tf.constant(0, dtype=tf.int32),
+                "location": tf.constant("", dtype=tf.string),  # empty string for padding
+                "date_captured": tf.constant("", dtype=tf.string),  # empty string for padding
             },
         ),
     )
@@ -208,6 +220,8 @@ def make_cct_tfrecords_dataset(
     
     # Create info object
     info = CCTInfo(categories)
+    # Store num_samples in info for percentage filtering
+    info.num_samples = num_samples
     
     return ds, info
 

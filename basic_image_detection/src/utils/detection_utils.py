@@ -169,6 +169,106 @@ def decode_predictions_grid(
     return boxes
 
 
+def decode_predictions_anchors(
+    anchor_pred,
+    num_classes,
+    grid_size,
+    num_anchors=3,
+    anchor_scales=None,
+    threshold=0.5,
+    nms_iou=0.5,
+    max_boxes=20,
+    min_box_size=0.01,
+):
+    """
+    Decode anchor-based predictions to bounding boxes with NMS.
+    
+    Input format: [H, W, num_anchors * (1 + 4 + num_classes)] where for each anchor:
+    - [..., anchor_idx * depth + 0]: objectness
+    - [..., anchor_idx * depth + 1:5]: bbox offsets (offset_x, offset_y, offset_w, offset_h)
+    - [..., anchor_idx * depth + 5:]: class probabilities
+    
+    Output: List of dicts with bbox, class_id, score
+    
+    Args:
+        anchor_pred: [H, W, num_anchors * (1 + 4 + num_classes)] numpy array
+        num_classes: Number of classes
+        grid_size: (height, width) of the grid
+        num_anchors: Number of anchors per grid cell
+        anchor_scales: List of (width, height) anchor scales. If None, uses defaults.
+        threshold: Objectness threshold
+        nms_iou: IoU threshold for NMS
+        max_boxes: Maximum boxes to return
+        min_box_size: Minimum box size (normalized) to filter out
+    
+    Returns:
+        List of detection dicts: [{"bbox": [ymin, xmin, ymax, xmax], "class_id": int, "score": float}, ...]
+    """
+    from .anchor_utils import generate_default_anchors, decode_anchor_to_box
+    
+    H, W = grid_size
+    depth_per_anchor = 1 + 4 + num_classes
+    
+    # Generate anchor boxes
+    anchors = generate_default_anchors(grid_size, num_anchors, anchor_scales)
+    
+    boxes = []
+    
+    for y in range(H):
+        for x in range(W):
+            cell = anchor_pred[y, x]
+            
+            for a in range(num_anchors):
+                anchor_start = a * depth_per_anchor
+                
+                # Objectness
+                obj = cell[anchor_start]
+                if obj < threshold:
+                    continue
+                
+                # Bbox offsets
+                offsets = cell[anchor_start + 1:anchor_start + 5]
+                
+                # Get anchor box
+                anchor = anchors[y, x, a]
+                
+                # Decode to absolute box
+                bbox = decode_anchor_to_box(anchor, offsets)
+                ymin, xmin, ymax, xmax = bbox
+                
+                # Filter out very small boxes
+                if (ymax - ymin) < min_box_size or (xmax - xmin) < min_box_size:
+                    continue
+                
+                # Clip to [0, 1]
+                xmin = np.clip(xmin, 0, 1)
+                ymin = np.clip(ymin, 0, 1)
+                xmax = np.clip(xmax, 0, 1)
+                ymax = np.clip(ymax, 0, 1)
+                
+                # Skip if box is too small after clipping
+                if (xmax - xmin) < min_box_size or (ymax - ymin) < min_box_size:
+                    continue
+                
+                # Class
+                class_probs = cell[anchor_start + 5:anchor_start + 5 + num_classes]
+                class_id = int(np.argmax(class_probs))
+                score = float(obj * class_probs[class_id])  # Combine objectness and class confidence
+                
+                boxes.append({
+                    "bbox": [ymin, xmin, ymax, xmax],
+                    "class_id": class_id,
+                    "score": score,
+                })
+    
+    # Apply NMS
+    if len(boxes) > 0:
+        keep_indices = nms(boxes, None, iou_threshold=nms_iou, max_output_size=max_boxes)
+        boxes = [boxes[i] for i in keep_indices]
+    
+    return boxes
+
+
 def compute_map(
     predictions_list,
     ground_truth_list,
@@ -306,6 +406,7 @@ def convert_bbox_format(bbox, from_format="cxcywh", to_format="xyxy"):
 class DetectionLossFocal(keras.losses.Loss):
     """
     Detection loss with focal loss for objectness.
+    Supports both grid-based (legacy) and anchor-based detection.
     Inherits from keras.losses.Loss for proper serialization.
     
     For severe class imbalance (many empty images), use:
@@ -314,32 +415,56 @@ class DetectionLossFocal(keras.losses.Loss):
     - Higher focal_gamma (2.0-3.0) to focus on hard negatives
     - Higher bbox_loss_weight (5.0-20.0) to emphasize accurate box regression
     """
-    def __init__(self, focal_gamma=2.0, focal_alpha=0.5, positive_weight=5.0, bbox_loss_weight=10.0, name="detection_loss_focal", **kwargs):
+    def __init__(self, focal_gamma=2.0, focal_alpha=0.5, positive_weight=5.0, bbox_loss_weight=10.0, 
+                 num_anchors=1, use_anchors=False, objectness_label_smoothing=0.1, name="detection_loss_focal", **kwargs):
         super().__init__(name=name, **kwargs)
-        self.focal_gamma = focal_gamma
-        self.focal_alpha = focal_alpha
-        self.positive_weight = positive_weight  # Additional weight for positive examples
-        self.bbox_loss_weight = bbox_loss_weight  # Weight for bbox regression loss
+        # Ensure all values are Python primitives (not tensors) for JSON serialization
+        # Convert tensors/numpy arrays to Python primitives
+        def to_primitive(x):
+            if hasattr(x, 'numpy'):
+                return x.numpy().item() if x.numpy().size == 1 else float(x.numpy()[0])
+            elif hasattr(x, 'item'):
+                return x.item()
+            else:
+                return x
+        
+        self.focal_gamma = float(to_primitive(focal_gamma))
+        self.focal_alpha = float(to_primitive(focal_alpha))
+        self.positive_weight = float(to_primitive(positive_weight))
+        self.bbox_loss_weight = float(to_primitive(bbox_loss_weight))
+        self.num_anchors = int(to_primitive(num_anchors))
+        self.use_anchors = bool(to_primitive(use_anchors))
+        self.objectness_label_smoothing = float(to_primitive(objectness_label_smoothing))
     
     def call(self, y_true, y_pred):
         """Compute the loss."""
-        return self._compute_loss(y_true, y_pred)
+        if self.use_anchors and self.num_anchors > 1:
+            return self._compute_loss_anchors(y_true, y_pred)
+        else:
+            return self._compute_loss_grid(y_true, y_pred)
     
-    def _compute_loss(self, y_true, y_pred):
-        """Compute the actual loss."""
+    def _compute_loss_grid(self, y_true, y_pred):
+        """Compute loss for grid-based detection """
         # Objectness with focal loss + positive weighting
         obj_true = y_true[..., 0:1]   # [B, S, S, 1]
         obj_pred = y_pred[..., 0:1]   # [B, S, S, 1]
         
+        # Apply label smoothing to objectness targets to prevent overconfidence
+        # Smooth: 1.0 -> (1.0 - smoothing), 0.0 -> 0.0 (negatives stay at 0.0)
+        # The previous formula incorrectly gave negatives a target of 0.5 * smoothing,
+        # which caused models to learn that predicting low objectness was acceptable
+        obj_true_smooth = obj_true * (1.0 - self.objectness_label_smoothing)
+        
         eps = 1e-7
         obj_pred_clipped = tf.clip_by_value(obj_pred, eps, 1.0 - eps)
-        ce = -(obj_true * tf.math.log(obj_pred_clipped) + 
-               (1.0 - obj_true) * tf.math.log(1.0 - obj_pred_clipped))
-        p_t = obj_true * obj_pred_clipped + (1.0 - obj_true) * (1.0 - obj_pred_clipped)
-        alpha_factor = obj_true * self.focal_alpha + (1.0 - obj_true) * (1.0 - self.focal_alpha)
+        ce = -(obj_true_smooth * tf.math.log(obj_pred_clipped) + 
+               (1.0 - obj_true_smooth) * tf.math.log(1.0 - obj_pred_clipped))
+        p_t = obj_true_smooth * obj_pred_clipped + (1.0 - obj_true_smooth) * (1.0 - obj_pred_clipped)
+        alpha_factor = obj_true_smooth * self.focal_alpha + (1.0 - obj_true_smooth) * (1.0 - self.focal_alpha)
         modulating_factor = tf.pow(1.0 - p_t, self.focal_gamma)
         
         # Apply additional positive weight to emphasize objects
+        # Use original obj_true for masking (not smoothed version)
         positive_mask = obj_true  # 1.0 where there's an object, 0.0 otherwise
         weight_factor = 1.0 + positive_mask * (self.positive_weight - 1.0)
         
@@ -408,12 +533,86 @@ class DetectionLossFocal(keras.losses.Loss):
         total = obj_loss + box_loss + cls_loss
         return tf.reduce_mean(total)
     
+    def _compute_loss_anchors(self, y_true, y_pred):
+        """Compute loss for anchor-based detection."""
+        # y_true: [B, H, W, num_anchors * (1 + 4 + num_classes)]
+        # y_pred: [B, H, W, num_anchors * (1 + 4 + num_classes)]
+        
+        depth_per_anchor = 1 + 4 + (y_true.shape[-1] // self.num_anchors - 5)
+        num_classes = depth_per_anchor - 5
+        
+        # Reshape to separate anchors: [B, H, W, num_anchors, depth_per_anchor]
+        y_true_reshaped = tf.reshape(y_true, [-1, y_true.shape[1], y_true.shape[2], 
+                                              self.num_anchors, depth_per_anchor])
+        y_pred_reshaped = tf.reshape(y_pred, [-1, y_pred.shape[1], y_pred.shape[2], 
+                                              self.num_anchors, depth_per_anchor])
+        
+        # Process each anchor
+        anchor_losses = []
+        for a in range(self.num_anchors):
+            # Extract anchor-specific predictions
+            obj_true = y_true_reshaped[..., a, 0:1]   # [B, H, W, 1]
+            obj_pred = y_pred_reshaped[..., a, 0:1]   # [B, H, W, 1]
+            box_true = y_true_reshaped[..., a, 1:5]   # [B, H, W, 4] - offsets
+            box_pred = y_pred_reshaped[..., a, 1:5]   # [B, H, W, 4] - offsets
+            cls_true = y_true_reshaped[..., a, 5:]    # [B, H, W, num_classes]
+            cls_pred = y_pred_reshaped[..., a, 5:]    # [B, H, W, num_classes]
+            
+            # Objectness loss (focal loss)
+            # Apply label smoothing to objectness targets to prevent overconfidence
+            # Smooth: 1.0 -> (1.0 - smoothing), 0.0 -> 0.0 (negatives stay at 0.0)
+            # The previous formula incorrectly gave negatives a target of 0.5 * smoothing,
+            # which caused models to learn that predicting low objectness was acceptable
+            obj_true_smooth = obj_true * (1.0 - self.objectness_label_smoothing)
+            
+            eps = 1e-7
+            obj_pred_clipped = tf.clip_by_value(obj_pred, eps, 1.0 - eps)
+            ce = -(obj_true_smooth * tf.math.log(obj_pred_clipped) + 
+                   (1.0 - obj_true_smooth) * tf.math.log(1.0 - obj_pred_clipped))
+            p_t = obj_true_smooth * obj_pred_clipped + (1.0 - obj_true_smooth) * (1.0 - obj_pred_clipped)
+            alpha_factor = obj_true_smooth * self.focal_alpha + (1.0 - obj_true_smooth) * (1.0 - self.focal_alpha)
+            modulating_factor = tf.pow(1.0 - p_t, self.focal_gamma)
+            # Use original obj_true for masking (not smoothed version)
+            positive_mask = obj_true
+            weight_factor = 1.0 + positive_mask * (self.positive_weight - 1.0)
+            obj_loss = alpha_factor * modulating_factor * ce * weight_factor
+            
+            # Bbox loss (L1 or smooth L1 on offsets)
+            # For anchor-based, we use smooth L1 on offsets
+            box_diff = box_true - box_pred
+            box_abs_diff = tf.abs(box_diff)
+            smooth_l1 = tf.where(
+                box_abs_diff < 1.0,
+                0.5 * box_diff ** 2,
+                box_abs_diff - 0.5
+            )
+            box_loss = tf.reduce_sum(smooth_l1, axis=-1, keepdims=True)  # [B, H, W, 1]
+            box_loss = box_loss * obj_true  # Mask by objectness
+            box_loss = box_loss * self.bbox_loss_weight
+            
+            # Class loss
+            cls_bce = tf.keras.backend.binary_crossentropy(cls_true, cls_pred)
+            cls_loss = tf.reduce_mean(cls_bce, axis=-1, keepdims=True)  # [B, H, W, 1]
+            cls_loss = cls_loss * obj_true  # Mask by objectness
+            
+            # Sum for this anchor
+            anchor_loss = obj_loss + box_loss + cls_loss
+            anchor_losses.append(anchor_loss)
+        
+        # Average across anchors
+        total = tf.reduce_mean(tf.stack(anchor_losses, axis=0), axis=0)
+        return tf.reduce_mean(total)
+    
     def get_config(self):
+        # Ensure all values are JSON-serializable Python primitives
         return {
-            "focal_gamma": self.focal_gamma,
-            "focal_alpha": self.focal_alpha,
-            "positive_weight": self.positive_weight,
-            "bbox_loss_weight": self.bbox_loss_weight,
+            "focal_gamma": float(self.focal_gamma),
+            "focal_alpha": float(self.focal_alpha),
+            "positive_weight": float(self.positive_weight),
+            "bbox_loss_weight": float(self.bbox_loss_weight),
+            "num_anchors": int(self.num_anchors),
+            "use_anchors": bool(self.use_anchors),
+            "objectness_label_smoothing": float(self.objectness_label_smoothing),
         }
 
 

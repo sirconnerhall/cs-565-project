@@ -224,6 +224,15 @@ def create_tf_example(sample: Dict, image_size: Optional[tuple] = None) -> tf.tr
     bboxes_flat = bboxes_np.flatten().tolist()
     labels_flat = labels_np.tolist()
     
+    # Get metadata (location and date_captured)
+    location = sample.get("location")
+    date_captured = sample.get("date_captured")
+    
+    # Convert location to string if it's not None, otherwise use empty string
+    location_str = str(location) if location is not None else ""
+    # date_captured should already be a string or None
+    date_captured_str = date_captured if date_captured is not None else ""
+    
     # Create feature dict
     feature = {
         'image/encoded': _bytes_feature(img_bytes),
@@ -234,6 +243,8 @@ def create_tf_example(sample: Dict, image_size: Optional[tuple] = None) -> tf.tr
         'bboxes': _float_feature(bboxes_flat),
         'labels': _int64_feature(labels_flat),
         'file_name': _bytes_feature(sample["file_name"].encode('utf-8')),
+        'location': _bytes_feature(location_str.encode('utf-8')),
+        'date_captured': _bytes_feature(date_captured_str.encode('utf-8')),
     }
     
     return tf.train.Example(features=tf.train.Features(feature=feature))

@@ -1,24 +1,38 @@
 """
 Build two-stage detector without metadata (TSNM).
 Uses two-stage transfer learning (frozen then unfrozen backbone).
+Uses CSPDarkNet backbone with anchor-based detection.
 """
 
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers
 
-from ..utils.load_pretrained_detector import load_backbone
+from ..utils.yolo_backbone import (
+    build_cspdarknet_backbone,
+    build_efficientnet_backbone,
+    preprocess_input_cspdarknet,
+    preprocess_input_efficientnet,
+)
 
 
 def build_detector(
     image_size=(320, 320),
     num_classes=1,
-    backbone_type="ssd_mobilenet_v2",
+    backbone_type="cspdarknet",
     freeze_backbone=True,
+    num_anchors=3,
 ):
     """
-    Build an SSD-style detection model without metadata.
+    Build an anchor-based detection model with CSPDarkNet backbone.
     Uses two-stage transfer learning.
+    
+    Args:
+        image_size: (height, width) of input images
+        num_classes: Number of object classes
+        backbone_type: Type of backbone (default "cspdarknet")
+        freeze_backbone: Whether to freeze backbone weights initially
+        num_anchors: Number of anchors per grid cell (default 3)
     """
     h, w = image_size
     input_shape = (h, w, 3)
@@ -26,8 +40,20 @@ def build_detector(
     # Image input
     image_input = keras.Input(shape=input_shape, name="image")
     
-    # Load pre-trained backbone
-    backbone = load_backbone(backbone_type, input_shape=input_shape)
+    # Build backbone (use EfficientNet-B0 if available, otherwise CSPDarkNet)
+    if backbone_type == "efficientnet_b0" or backbone_type == "efficientnet":
+        backbone = build_efficientnet_backbone(
+            input_shape=input_shape,
+            weights='imagenet'
+        )
+        preprocess_fn = preprocess_input_efficientnet
+    else:
+        # Default to CSPDarkNet (no ImageNet weights)
+        backbone = build_cspdarknet_backbone(
+            input_shape=input_shape,
+            weights='imagenet'
+        )
+        preprocess_fn = preprocess_input_cspdarknet
     
     if freeze_backbone:
         backbone.trainable = False
@@ -36,37 +62,26 @@ def build_detector(
         backbone.trainable = True
         print("[Model] Backbone trainable")
     
-    # Preprocess image
-    if backbone_type.startswith("mobilenet") or backbone_type == "ssd_mobilenet_v2":
-        x_img = keras.applications.mobilenet_v2.preprocess_input(image_input)
-    elif backbone_type == "resnet50":
-        x_img = keras.applications.resnet50.preprocess_input(image_input)
-    elif backbone_type == "efficientnet_b0":
-        x_img = keras.applications.efficientnet.preprocess_input(image_input)
-    else:
-        x_img = image_input / 255.0
+    # Preprocess and extract features
+    x_img = preprocess_fn(image_input)
+    x_img = backbone(x_img, training=not freeze_backbone)
     
-    # Extract features from backbone
-    feature_maps = backbone(x_img, training=not freeze_backbone)
+    # Detection head
+    x = layers.Conv2D(256, 3, padding="same", activation="swish")(x_img)
+    x = layers.Conv2D(256, 3, padding="same", activation="swish")(x)
+    x = layers.Conv2D(128, 3, padding="same", activation="swish")(x)
     
-    # Use the higher resolution feature map
-    if isinstance(feature_maps, (list, tuple)):
-        x_img = feature_maps[-1]
-    else:
-        x_img = feature_maps
+    # Output: num_anchors * (objectness + 4 offsets + num_classes) per grid cell
+    depth_per_anchor = 1 + 4 + num_classes
+    total_depth = num_anchors * depth_per_anchor
     
-    # Detection head - SSD-style (no metadata)
-    x = layers.Conv2D(256, 3, padding="same", activation="relu")(x_img)
-    x = layers.Conv2D(256, 3, padding="same", activation="relu")(x)
-    x = layers.Conv2D(128, 3, padding="same", activation="relu")(x)
-    
-    # Output layers
-    obj_output = layers.Conv2D(1, 1, padding="same", activation="sigmoid", name="objectness")(x)
-    bbox_output = layers.Conv2D(4, 1, padding="same", activation="sigmoid", name="bbox")(x)
-    cls_output = layers.Conv2D(num_classes, 1, padding="same", activation="sigmoid", name="classes")(x)
-    
-    # Concatenate all outputs
-    outputs = layers.Concatenate(axis=-1, name="detections")([obj_output, bbox_output, cls_output])
+    outputs = layers.Conv2D(
+        total_depth,
+        1,
+        padding="same",
+        activation="sigmoid",
+        name="anchor_detections",
+    )(x)
     
     model = keras.Model(
         inputs=image_input,

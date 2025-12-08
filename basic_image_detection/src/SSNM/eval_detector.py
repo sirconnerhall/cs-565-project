@@ -13,7 +13,8 @@ import matplotlib.patches as patches
 from ..pipelines.coco_tfds_pipeline import make_coco_dataset
 from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
 from ..utils.detection_utils import compute_map, DetectionLossFocal, make_component_loss_metrics, objectness_accuracy
-from .train_detector import infer_grid_size, make_grid_encoder
+from .train_detector import infer_grid_size
+from ..utils.anchor_encoder import make_grid_encoder
 
 
 def load_config():
@@ -205,21 +206,18 @@ def main():
     )
     component_metrics = make_component_loss_metrics(loss_fn)
     
+    # Import FiLMLayer for model loading (even though SSNM doesn't use it, models might be shared)
+    from ..utils.film_layer import FiLMLayer
+    
     custom_objects = {
         "DetectionLossFocal": DetectionLossFocal,
         "objectness_accuracy": objectness_accuracy,
+        "FiLMLayer": FiLMLayer,
     }
     for metric_fn in component_metrics:
         custom_objects[metric_fn.__name__] = metric_fn
 
-    model = keras.models.load_model(
-        model_path,
-        custom_objects=custom_objects,
-    )
-
-    model.summary()
-
-    # Load dataset
+    # Load dataset FIRST to get num_classes (needed to build model with correct architecture)
     dataset_name = config.get("dataset", "cct")
     
     if dataset_name == "coco":
@@ -247,6 +245,44 @@ def main():
 
     num_classes = val_info.features["objects"]["label"].num_classes
     class_names = val_info.features["objects"]["label"].names
+    
+    # Now try to load model (with correct num_classes known)
+    print(f"\n[Model] Attempting to load model from {model_path}")
+    try:
+        model = keras.models.load_model(
+            model_path,
+            custom_objects=custom_objects,
+        )
+        print(f"✓ Model loaded successfully from Keras format!")
+    except Exception as e:
+        print(f"✗ Error loading model: {e}")
+        print("Trying to load weights only...")
+        # Build model with correct num_classes from dataset
+        from .build_detector import build_detector
+        pretrained_model_type = config.get("pretrained_model_type", "efficientnet_b0")
+        num_anchors = config.get("num_anchors", 3)
+        model = build_detector(
+            image_size=image_size,
+            num_classes=num_classes,
+            num_anchors=num_anchors,
+            backbone_type=pretrained_model_type,
+        )
+        # Check for weights file with the pattern used by SafeModelCheckpoint
+        weights_path = model_path.parent / f"{model_name}_best_weights.h5"
+        if not weights_path.exists():
+            weights_path = model_path.with_suffix('.h5')
+        
+        if weights_path.exists():
+            model.load_weights(str(weights_path))
+            print(f"✓ Loaded weights from {weights_path}")
+        else:
+            print(f"✗ Error: Neither model nor weights file found.")
+            print(f"  Looked for: {model_path}")
+            print(f"  Looked for weights: {model_path.parent / f'{model_name}_best_weights.h5'}")
+            print(f"  Looked for weights (fallback): {model_path.with_suffix('.h5')}")
+            return
+
+    model.summary()
     grid_size = infer_grid_size(image_size)
 
     encoder = make_grid_encoder(num_classes, grid_size)

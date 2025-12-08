@@ -218,19 +218,21 @@ def load_cct_annotations(
 
 def extract_cct_metadata_features(sample):
     """
-    Extract metadata features from a CCT sample.
+    Extract metadata features from a CCT sample with cyclical encoding.
     
     Args:
         sample: Dict with keys: location, date_captured, seq_id
     
     Returns:
-        numpy array of metadata features:
+        numpy array of metadata features (8 features):
         - location_id (normalized)
-        - hour (0-23, normalized to 0-1)
-        - day_of_week (0-6, normalized to 0-1)
-        - month (1-12, normalized to 0-1)
+        - hour_sin, hour_cos (cyclical encoding)
+        - day_of_week_sin, day_of_week_cos (cyclical encoding)
+        - month_sin, month_cos (cyclical encoding)
         - brightness (will be computed from image, placeholder 0 here)
     """
+    from ..utils.metadata_encoding import encode_metadata_cyclical_numpy
+    
     location = sample.get("location")
     date_str = sample.get("date_captured")
     
@@ -252,21 +254,22 @@ def extract_cct_metadata_features(sample):
         try:
             # Parse date string (format: "2013-10-04 13:31:53")
             dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-            hour = dt.hour / 23.0  # Normalize to [0, 1]
-            day_of_week = dt.weekday() / 6.0  # 0=Monday, 6=Sunday, normalize to [0, 1]
-            month = (dt.month - 1) / 11.0  # Normalize to [0, 1]
+            hour = dt.hour  # Keep as 0-23 for cyclical encoding
+            day_of_week = dt.weekday()  # 0=Monday, 6=Sunday
+            month = dt.month  # 1-12
         except (ValueError, TypeError):
             pass
     
     # Brightness placeholder (will be computed from image in dataset pipeline)
     brightness = 0.0
     
-    return np.array([location_id, hour, day_of_week, month, brightness], dtype=np.float32)
+    # Use cyclical encoding
+    return encode_metadata_cyclical_numpy(location_id, hour, day_of_week, month, brightness)
 
 
 def add_cct_metadata(image, targets, sample_metadata):
     """
-    Add CCT metadata to dataset pipeline.
+    Add CCT metadata to dataset pipeline with cyclical encoding.
     Computes brightness from image and adds to metadata.
     
     Args:
@@ -275,8 +278,10 @@ def add_cct_metadata(image, targets, sample_metadata):
         sample_metadata: Dict with location, date_captured, etc.
     
     Returns:
-        (image, metadata), targets
+        (image, metadata), targets where metadata is [8] with cyclical encoding
     """
+    from ..utils.metadata_encoding import encode_metadata_cyclical_tf
+    
     # Compute brightness from image
     brightness = tf.reduce_mean(image)  # [B] or scalar
     
@@ -298,12 +303,13 @@ def add_cct_metadata(image, targets, sample_metadata):
     # Date/time features (simplified - would need proper parsing in TF)
     # For now, use placeholders that will be computed from date string
     # In practice, you'd parse this in the dataset pipeline
-    hour = tf.constant(0.5, dtype=tf.float32)  # Placeholder
-    day_of_week = tf.constant(0.5, dtype=tf.float32)  # Placeholder
-    month = tf.constant(0.5, dtype=tf.float32)  # Placeholder
+    # Use actual hour values (0-23) for cyclical encoding, not normalized
+    hour = tf.constant(12.0, dtype=tf.float32)  # Placeholder: noon
+    day_of_week = tf.constant(3.0, dtype=tf.float32)  # Placeholder: Thursday
+    month = tf.constant(6.0, dtype=tf.float32)  # Placeholder: June
     
-    # Combine metadata
-    metadata = tf.stack([location_id, hour, day_of_week, month, brightness], axis=0)
+    # Use cyclical encoding
+    metadata = encode_metadata_cyclical_tf(location_id, hour, day_of_week, month, brightness)
     
     return (image, metadata), targets
 

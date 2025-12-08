@@ -1,5 +1,5 @@
 """
-Evaluate YOLO-style detection model with metadata integration.
+Evaluate SSM (Single Stage, with Metadata) detection model.
 """
 
 import json
@@ -12,8 +12,15 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from ..pipelines.cct_tfrecords_pipeline import make_cct_tfrecords_dataset
-from .build_detector import build_ssd_detector_with_metadata
-from ..utils.detection_utils import decode_predictions_grid, decode_predictions_anchors, compute_map, compute_iou, DetectionLossFocal, objectness_accuracy, make_component_loss_metrics
+from .build_detector import build_detector
+from ..utils.detection_utils import (
+    decode_predictions_anchors,
+    compute_map,
+    compute_iou,
+    DetectionLossFocal,
+    objectness_accuracy,
+    make_component_loss_metrics,
+)
 
 
 def load_config():
@@ -91,11 +98,11 @@ def main():
     batch_size = config["batch_size"]
     
     # Model name is set here, not from config
-    model_name = "TSM"
+    model_name = "SSM"
     models_dir = project_root / config["models_dir"]
     model_path = models_dir / f"{model_name}_best.keras"
     
-    pretrained_model_type = config.get("pretrained_model_type", "cspdarknet")
+    pretrained_model_type = config.get("pretrained_model_type", "efficientnet_b0")
     num_anchors = config.get("num_anchors", 3)
     use_anchors = config.get("use_anchors", True)
     
@@ -104,7 +111,15 @@ def main():
     positive_weight = config.get("positive_weight", 4.0)
     bbox_loss_weight = config.get("bbox_loss_weight", 10.0)
     
-    print("Loading model:", model_path)
+    print("=" * 60)
+    print(f"Evaluating {model_name} Model")
+    print("=" * 60)
+    print(f"Loading model: {model_path}")
+    
+    if not model_path.exists():
+        print(f"Error: Model file not found: {model_path}")
+        print("Please train the model first.")
+        return
     
     loss_fn = DetectionLossFocal(
         focal_gamma=focal_gamma,
@@ -133,11 +148,12 @@ def main():
         custom_objects[metric_fn.__name__] = metric_fn
     
     # Load dataset FIRST to get num_classes (needed to build model with correct architecture)
+    # Load dataset
     dataset_name = config.get("dataset", "cct")
     metadata_dim = 8  # Updated: 8 features with cyclical encoding
     
     if dataset_name != "cct":
-        raise ValueError(f"YOLO detector currently only supports CCT dataset")
+        raise ValueError(f"SSM detector currently only supports CCT dataset")
     
     # Load validation dataset from TFRecords
     cct_tfrecords_dir = config.get("cct_tfrecords_dir")
@@ -162,6 +178,7 @@ def main():
     
     print(f"\n[Dataset] Using TFRecords from {cct_tfrecords_dir}")
     print(f"[Dataset] Validation split: {val_split_base}")
+    
     val_ds_raw, val_info = make_cct_tfrecords_dataset(
         tfrecords_dir=cct_tfrecords_dir,
         split=val_split_base,
@@ -188,17 +205,18 @@ def main():
         print(f"✗ Error loading model: {e}")
         print("Trying to load weights only...")
         # Build model with correct num_classes from dataset
-        model = build_ssd_detector_with_metadata(
+        model = build_detector(
             image_size=image_size,
             num_classes=num_classes,
             metadata_dim=metadata_dim,
             backbone_type=pretrained_model_type,
-            freeze_backbone=False,  # For evaluation, backbone can be trainable
             num_anchors=num_anchors,
         )
         # Check for weights file with the pattern used by SafeModelCheckpoint
+        # Training saves as: SSM_best_weights.h5 (replaces .keras with _weights.h5)
         weights_path = model_path.parent / f"{model_name}_best_weights.h5"
         if not weights_path.exists():
+            # Fallback: try the simple .h5 suffix
             weights_path = model_path.with_suffix('.h5')
         
         if weights_path.exists():
@@ -218,7 +236,6 @@ def main():
     
     def add_metadata(images, targets):
         # Extract location and date_captured from targets
-        # These should already be batched [B] tensors from the TFRecord parser
         batch_size = tf.shape(images)[0]
         
         # Get location and date_captured, with defaults if missing
@@ -270,10 +287,24 @@ def main():
     # Collect predictions, ground truth, and images for visualization
     predictions_list = []
     ground_truth_list = []
-    images_list = []  # Store images for visualization
-    pred_grids_all = []  # Store all prediction grids for diagnostics
+    images_list = []
+    
+    # Infer grid size from image size
+    grid_h = image_size[0] // 32
+    grid_w = image_size[1] // 32
+    grid_size = (grid_h, grid_w)
+    
+    print(f"Grid size: {grid_h}x{grid_w}")
+    print(f"Using anchor-based decoding: {use_anchors}")
+    print(f"Number of anchors: {num_anchors}")
+    
+    max_batches = config.get("eval_max_batches", 50)  # Limit evaluation batches
+    print(f"Evaluating on first {max_batches} batches...")
     
     for batch_idx, batch in enumerate(val_ds_with_meta):
+        if batch_idx >= max_batches:
+            break
+            
         if isinstance(batch, tuple) and len(batch) == 2:
             inputs, targets = batch
             if isinstance(inputs, tuple):
@@ -285,8 +316,7 @@ def main():
             continue
         
         # Ensure images are in correct format for model preprocessing
-        # Model expects [0, 255] range for mobilenet_v2.preprocess_input
-        # Dataset provides [0, 1] range, so convert if needed
+        # Model expects [0, 255] range for preprocessing
         if images.dtype == tf.float32 and tf.reduce_max(images) <= 1.0:
             # Convert from [0, 1] to [0, 255] for preprocessing
             images_for_model = images * 255.0
@@ -303,42 +333,10 @@ def main():
         pred_grids_np = pred_grids.numpy()
         images_np = images.numpy()
         
-        # Store for diagnostics
-        pred_grids_all.append(pred_grids_np)
-        
-        # Detailed diagnostics for first batch
-        if batch_idx == 0:
-            print(f"\n[Debug] First batch predictions:")
-            print(f"  Prediction shape: {pred_grids_np.shape}")
-            print(f"  Prediction dtype: {pred_grids_np.dtype}")
-            print(f"  Objectness channel stats:")
-            obj_channel = pred_grids_np[..., 0]  # Objectness is first channel
-            print(f"    Min: {np.min(obj_channel):.6f}, Max: {np.max(obj_channel):.6f}")
-            print(f"    Mean: {np.mean(obj_channel):.6f}, Std: {np.std(obj_channel):.6f}")
-            print(f"    Non-zero count: {np.count_nonzero(obj_channel)} / {obj_channel.size}")
-            print(f"  Bbox channel stats (cx, cy, w, h):")
-            for i, name in enumerate(['cx', 'cy', 'w', 'h']):
-                bbox_ch = pred_grids_np[..., 1 + i]
-                print(f"    {name}: min={np.min(bbox_ch):.6f}, max={np.max(bbox_ch):.6f}, mean={np.mean(bbox_ch):.6f}")
-                # Show values for cells with high objectness
-                high_obj_mask = obj_channel > 0.5
-                if np.any(high_obj_mask):
-                    high_obj_bbox = bbox_ch[high_obj_mask]
-                    print(f"      (where obj>0.5): min={np.min(high_obj_bbox):.6f}, max={np.max(high_obj_bbox):.6f}, mean={np.mean(high_obj_bbox):.6f}")
-            print(f"  Image stats:")
-            print(f"    Min: {np.min(images_np):.6f}, Max: {np.max(images_np):.6f}")
-            print(f"    Mean: {np.mean(images_np):.6f}, Std: {np.std(images_np):.6f}")
-            if metadata is not None:
-                metadata_np = metadata.numpy() if hasattr(metadata, 'numpy') else metadata
-                print(f"  Metadata stats:")
-                print(f"    Shape: {metadata_np.shape}")
-                print(f"    Min: {np.min(metadata_np):.6f}, Max: {np.max(metadata_np):.6f}")
-                print(f"    Mean: {np.mean(metadata_np):.6f}")
-        
         # Decode predictions for each image in batch
         batch_size_actual = pred_grids_np.shape[0]
         for i in range(batch_size_actual):
-            pred_grid = pred_grids_np[i]  # [H, W, 5 + num_classes]
+            pred_grid = pred_grids_np[i]  # [H, W, num_anchors * (1 + 4 + num_classes)]
             image_np = images_np[i]  # [H, W, 3]
             
             # Convert image from normalized [0, 1] to [0, 255] uint8 if needed
@@ -347,30 +345,16 @@ def main():
             else:
                 image_np = image_np.astype(np.uint8)
             
-            # Decode to boxes
-            # Use reasonable threshold - model is now producing good objectness scores
-            if use_anchors and num_anchors > 1:
-                # Infer grid size from image size
-                grid_h = image_size[0] // 32
-                grid_w = image_size[1] // 32
-                grid_size = (grid_h, grid_w)
-                pred_boxes = decode_predictions_anchors(
-                    pred_grid,
-                    num_classes=num_classes,
-                    grid_size=grid_size,
-                    num_anchors=num_anchors,
-                    threshold=0.1,  # Reasonable threshold to filter low-confidence predictions
-                    nms_iou=0.5,  # Standard NMS IoU threshold
-                    max_boxes=50,  # Allow more boxes to see if we're missing matches
-                )
-            else:
-                pred_boxes = decode_predictions_grid(
-                    pred_grid,
-                    num_classes=num_classes,
-                    threshold=0.1,  # Reasonable threshold to filter low-confidence predictions
-                    nms_iou=0.5,  # Standard NMS IoU threshold
-                    max_boxes=50,  # Allow more boxes to see if we're missing matches
-                )
+            # Decode to boxes using anchor-based decoding
+            pred_boxes = decode_predictions_anchors(
+                pred_grid,
+                num_classes=num_classes,
+                grid_size=grid_size,
+                num_anchors=num_anchors,
+                threshold=0.1,  # Objectness threshold
+                nms_iou=0.5,  # NMS IoU threshold
+                max_boxes=50,  # Maximum boxes per image
+            )
             predictions_list.append(pred_boxes)
             
             # Get ground truth boxes
@@ -391,217 +375,93 @@ def main():
                 # Filter out padded boxes (zero boxes)
                 for bbox, label in zip(bboxes, labels):
                     # Check if bbox is valid (not all zeros)
-                    # Also check if box has valid dimensions
                     ymin, xmin, ymax, xmax = bbox
                     if (np.sum(np.abs(bbox)) > 1e-6 and  # Not all zeros
                         ymax > ymin and xmax > xmin and  # Valid dimensions
                         ymin >= 0 and xmin >= 0 and ymax <= 1 and xmax <= 1):  # Within bounds
                         gt_boxes.append({
-                            "bbox": [float(ymin), float(xmin), float(ymax), float(xmax)],  # [ymin, xmin, ymax, xmax]
+                            "bbox": [float(ymin), float(xmin), float(ymax), float(xmax)],
                             "class_id": int(label),
                         })
             
             ground_truth_list.append(gt_boxes)
-            images_list.append(image_np)  # Store image for visualization
+            images_list.append(image_np)
         
-        # Limit evaluation to first few batches for speed
-        if batch_idx >= 10:
-            break
+        if (batch_idx + 1) % 10 == 0:
+            print(f"Processed {batch_idx + 1} batches...")
     
-    # Diagnostic output before computing mAP
+    # Diagnostic output
     total_gt_boxes = sum(len(gt) for gt in ground_truth_list)
     total_pred_boxes = sum(len(pred) for pred in predictions_list)
     images_with_gt = sum(1 for gt in ground_truth_list if len(gt) > 0)
     images_with_pred = sum(1 for pred in predictions_list if len(pred) > 0)
     
-    print(f"\nDiagnostics:")
-    print(f"  Total images evaluated: {len(predictions_list)}")
-    print(f"  Images with GT boxes: {images_with_gt} ({100*images_with_gt/len(predictions_list):.1f}%)")
-    print(f"  Images with predictions: {images_with_pred} ({100*images_with_pred/len(predictions_list):.1f}%)")
-    print(f"  Total GT boxes: {total_gt_boxes}")
-    print(f"  Total predicted boxes: {total_pred_boxes}")
-    print(f"  Avg GT boxes per image: {total_gt_boxes/len(predictions_list):.2f}")
-    print(f"  Avg pred boxes per image: {total_pred_boxes/len(predictions_list):.2f}")
-    
-    # Check objectness scores
-    if len(pred_grids_all) > 0:
-        max_obj_scores = []
-        for batch_grids in pred_grids_all[:2]:  # Check first 2 batches
-            for img_idx in range(batch_grids.shape[0]):
-                max_obj = np.max(batch_grids[img_idx, ..., 0])
-                max_obj_scores.append(max_obj)
-                if len(max_obj_scores) >= 10:
-                    break
-            if len(max_obj_scores) >= 10:
-                break
-        if max_obj_scores:
-            print(f"  Max objectness scores (first {len(max_obj_scores)} images): {[f'{s:.3f}' for s in max_obj_scores]}")
-            print(f"  Avg max objectness: {np.mean(max_obj_scores):.3f}")
-    
-    # Detailed matching analysis before computing mAP
     print(f"\n{'='*60}")
-    print("Matching Analysis:")
+    print("Evaluation Summary")
+    print(f"{'='*60}")
+    print(f"Total images evaluated: {len(predictions_list)}")
+    print(f"Images with GT boxes: {images_with_gt} ({100*images_with_gt/len(predictions_list):.1f}%)")
+    print(f"Images with predictions: {images_with_pred} ({100*images_with_pred/len(predictions_list):.1f}%)")
+    print(f"Total GT boxes: {total_gt_boxes}")
+    print(f"Total predicted boxes: {total_pred_boxes}")
+    print(f"Avg GT boxes per image: {total_gt_boxes/len(predictions_list):.2f}")
+    print(f"Avg pred boxes per image: {total_pred_boxes/len(predictions_list):.2f}")
+    
+    # Compute mAP at different IoU thresholds
+    print(f"\n{'='*60}")
+    print("Computing mAP...")
     print(f"{'='*60}")
     
-    # Analyze class distribution
-    gt_class_counts = {}
-    pred_class_counts = {}
-    for gts in ground_truth_list:
-        for gt in gts:
-            cls = gt.get("class_id", 0)
-            gt_class_counts[cls] = gt_class_counts.get(cls, 0) + 1
-    for preds in predictions_list:
-        for pred in preds:
-            cls = pred.get("class_id", 0)
-            pred_class_counts[cls] = pred_class_counts.get(cls, 0) + 1
-    
-    print(f"\nClass Distribution:")
-    print(f"  GT classes: {sorted(gt_class_counts.items())}")
-    print(f"  Pred classes: {sorted(pred_class_counts.items())}")
-    
-    # Analyze IoU distribution for best matches
-    all_ious = []
-    matched_predictions = 0
-    matched_gts = set()
-    
-    for img_idx, (preds, gts) in enumerate(zip(predictions_list, ground_truth_list)):
-        for pred in preds:
-            best_iou = 0.0
-            best_gt_idx = None
-            for gt_idx, gt in enumerate(gts):
-                # Check class match first
-                if pred.get("class_id") == gt.get("class_id"):
-                    iou = compute_iou(pred["bbox"], gt["bbox"])
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt_idx = (img_idx, gt_idx)
-            if best_iou > 0:
-                all_ious.append(best_iou)
-                if best_iou >= 0.5:
-                    matched_predictions += 1
-                    if best_gt_idx:
-                        matched_gts.add(best_gt_idx)
-    
-    if all_ious:
-        print(f"\nIoU Analysis (best matches per prediction):")
-        print(f"  Total predictions analyzed: {sum(len(p) for p in predictions_list)}")
-        print(f"  Predictions with IoU > 0: {len(all_ious)}")
-        print(f"  Predictions with IoU >= 0.5: {matched_predictions}")
-        print(f"  Unique GT boxes matched: {len(matched_gts)}")
-        print(f"  IoU stats: min={np.min(all_ious):.3f}, max={np.max(all_ious):.3f}, mean={np.mean(all_ious):.3f}, median={np.median(all_ious):.3f}")
-        print(f"  IoU distribution:")
-        bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        hist, _ = np.histogram(all_ious, bins=bins)
-        for i in range(len(hist)):
-            print(f"    [{bins[i]:.1f}-{bins[i+1]:.1f}): {hist[i]}")
-    else:
-        print(f"\n  [Warning] No IoU matches found between predictions and GT!")
-        print(f"  This suggests class mismatches or box location issues.")
-    
-    # Box coordinate analysis - check if boxes are in wrong format
-    print(f"\n{'='*60}")
-    print("Box Coordinate Analysis:")
-    print(f"{'='*60}")
-    
-    # Sample a few predictions and GT boxes to compare
-    sample_preds = []
-    sample_gts = []
-    for img_idx in range(min(5, len(predictions_list))):
-        if len(predictions_list[img_idx]) > 0 and len(ground_truth_list[img_idx]) > 0:
-            sample_preds.append((img_idx, predictions_list[img_idx][0]))  # First prediction
-            sample_gts.append((img_idx, ground_truth_list[img_idx][0]))  # First GT
-    
-    if sample_preds and sample_gts:
-        print(f"\nSample Box Coordinates (first prediction and GT per image):")
-        for (img_idx, pred), (gt_img_idx, gt) in zip(sample_preds[:3], sample_gts[:3]):
-            if img_idx == gt_img_idx:
-                pred_bbox = pred["bbox"]
-                gt_bbox = gt["bbox"]
-                print(f"\n  Image {img_idx}:")
-                print(f"    Pred: class={pred['class_id']}, bbox={pred_bbox}, score={pred['score']:.3f}")
-                print(f"    GT:   class={gt['class_id']}, bbox={gt_bbox}")
-                print(f"    Format: [ymin, xmin, ymax, xmax] (normalized 0-1)")
-                # Check if boxes are valid
-                pred_area = (pred_bbox[2] - pred_bbox[0]) * (pred_bbox[3] - pred_bbox[1])
-                gt_area = (gt_bbox[2] - gt_bbox[0]) * (gt_bbox[3] - gt_bbox[1])
-                print(f"    Pred area: {pred_area:.4f}, GT area: {gt_area:.4f}")
-                iou = compute_iou(pred_bbox, gt_bbox)
-                print(f"    IoU: {iou:.4f}")
-    
-    # Check box size distribution
-    pred_areas = []
-    gt_areas = []
-    for preds in predictions_list:
-        for pred in preds:
-            bbox = pred["bbox"]
-            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            pred_areas.append(area)
-    for gts in ground_truth_list:
-        for gt in gts:
-            bbox = gt["bbox"]
-            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            gt_areas.append(area)
-    
-    if pred_areas and gt_areas:
-        print(f"\nBox Size Distribution:")
-        print(f"  Pred areas: min={np.min(pred_areas):.4f}, max={np.max(pred_areas):.4f}, mean={np.mean(pred_areas):.4f}, median={np.median(pred_areas):.4f}")
-        print(f"  GT areas:   min={np.min(gt_areas):.4f}, max={np.max(gt_areas):.4f}, mean={np.mean(gt_areas):.4f}, median={np.median(gt_areas):.4f}")
-        print(f"  [Note] If pred areas are much smaller/larger than GT, bbox regression may be wrong.")
-    
-    # Compute mAP
-    print(f"\nEvaluated {len(predictions_list)} images")
     map_3 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.3)
     map_5 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.5)
     map_8 = compute_map(predictions_list, ground_truth_list, num_classes, iou_threshold=0.8)
     
     print(f"\nResults:")
-    print(f"Mean Average Precision at IoU threshold 0.3: {map_3:.4f}")
-    print(f"Mean Average Precision at IoU threshold 0.5: {map_5:.4f}")
-    print(f"Mean Average Precision at IoU threshold 0.8: {map_8:.4f}")
+    print(f"  mAP@0.3: {map_3:.4f}")
+    print(f"  mAP@0.5: {map_5:.4f}")
+    print(f"  mAP@0.8: {map_8:.4f}")
     
     # Print some example predictions
-    print(f"\nExample predictions (first 5 images):")
+    print(f"\n{'='*60}")
+    print("Example Predictions (first 5 images)")
+    print(f"{'='*60}")
     for i in range(min(5, len(predictions_list))):
         print(f"\nImage {i+1}:")
         print(f"  GT boxes: {len(ground_truth_list[i])}")
         print(f"  Pred boxes: {len(predictions_list[i])}")
         if predictions_list[i]:
-            print(f"  Top prediction: class={predictions_list[i][0]['class_id']}, score={predictions_list[i][0]['score']:.3f}")
+            top_pred = predictions_list[i][0]
+            print(f"  Top prediction: class={top_pred['class_id']}, score={top_pred['score']:.3f}, bbox={top_pred['bbox']}")
         if ground_truth_list[i]:
             print(f"  GT classes: {[gt['class_id'] for gt in ground_truth_list[i]]}")
-    """
-    # Print some example predictions
-    print(f"\nExample predictions (first 5 images):")
-    for i in range(min(5, len(predictions_list))):
-        print(f"\nImage {i+1}:")
-        print(f"  GT boxes: {len(ground_truth_list[i])}")
-        print(f"  Pred boxes: {len(predictions_list[i])}")
-        if predictions_list[i]:
-            print(f"  Top prediction: class={predictions_list[i][0]['class_id']}, score={predictions_list[i][0]['score']:.3f}")
     
-    # Visualize first 5 images with predicted boxes
-    print("\n" + "=" * 60)
-    print("Visualizing predictions...")
-    print("=" * 60)
-    """
-    # Find images with predictions
-    images_with_predictions = []
-    for i, pred_boxes in enumerate(ground_truth_list):
-        if len(pred_boxes) > 0:
-            images_with_predictions.append(i)
-    
-    if len(images_with_predictions) == 0:
-        print("\nNo images with predicted boxes found. Model is not detecting any objects.")
-    else:
-        print(f"\nShowing first 5 examples of with ground truth boxes:")
-        for idx, img_idx in enumerate(images_with_predictions[:5]):
-            print(f"\nVisualizing image {img_idx + 1}")
-            draw_boxes(
-                images_list[img_idx],
-                ground_truth_list[img_idx],
-                predictions_list[img_idx],
-                class_names
-            )
+    # Optional: Visualize some examples
+    visualize = config.get("eval_visualize", False)
+    if visualize:
+        print(f"\n{'='*60}")
+        print("Visualizing predictions...")
+        print(f"{'='*60}")
+        
+        # Find images with both predictions and GT
+        images_to_show = []
+        for i, (preds, gts) in enumerate(zip(predictions_list, ground_truth_list)):
+            if len(preds) > 0 and len(gts) > 0:
+                images_to_show.append(i)
+            if len(images_to_show) >= 5:
+                break
+        
+        if len(images_to_show) == 0:
+            print("No images with both predictions and GT boxes found.")
+        else:
+            print(f"Showing {len(images_to_show)} examples...")
+            for idx in images_to_show:
+                print(f"\nVisualizing image {idx + 1}")
+                draw_boxes(
+                    images_list[idx],
+                    ground_truth_list[idx],
+                    predictions_list[idx],
+                    class_names
+                )
 
 
 if __name__ == "__main__":
