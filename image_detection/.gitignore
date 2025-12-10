@@ -1,5 +1,5 @@
 .venv/
-models/
+
 configs/
 test_images/
 */__pycache__/
